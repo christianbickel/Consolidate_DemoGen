@@ -235,7 +235,8 @@ export async function importDemoPlan(
     projectTypes,
     taskTypes,
     emit,
-    "Schema wird neu geladen."
+    "Schema wird neu geladen.",
+    true
   )
 
   const defaultRole =
@@ -870,7 +871,8 @@ async function reloadCreatedSchema(
   projectTypes: CreatedType[],
   taskTypes: CreatedType[],
   emit: (event: StreamEvent) => void,
-  message: string
+  message: string,
+  waitForRebuild = false
 ): Promise<Set<string>> {
   const created = [...projectTypes, ...taskTypes].filter((type) => type.key)
   const expectedFields = plan.taskTypes.flatMap((type, index) =>
@@ -878,11 +880,8 @@ async function reloadCreatedSchema(
   )
   if (created.length === 0 && expectedFields.length === 0) return new Set()
 
-  emit({ type: "log", level: "info", message })
-  let available = new Set<string>()
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  const readSchema = async () => {
     const schema = await loadDynamicSchema(session)
-    available = schema.taskInputFields
     let pendingTypes = 0
     for (const type of projectTypes) {
       if (!type.key) continue
@@ -896,8 +895,39 @@ async function reloadCreatedSchema(
       if (matched) type.enumName = matched
       else if (!type.enumName) pendingTypes += 1
     }
+    const available = schema.taskInputFields
     const pendingFields = expectedFields.filter((key) => !available.has(key))
-    if (pendingTypes === 0 && pendingFields.length === 0) {
+    return { available, ready: pendingTypes === 0 && pendingFields.length === 0 }
+  }
+
+  emit({ type: "log", level: "info", message })
+  let available = new Set<string>()
+  const first = await readSchema()
+  available = first.available
+  if (first.ready) {
+    emit({
+      type: "log",
+      level: "success",
+      message: "Schema neu geladen. Neue Typen und Zusatzfelder sind sichtbar.",
+    })
+    return available
+  }
+
+  if (waitForRebuild) {
+    emit({
+      type: "log",
+      level: "info",
+      message:
+        "Das Schema übernimmt neue Typen gebündelt, etwa 30 Sekunden nach der letzten Änderung. Der Import wartet diesen Zeitraum ab.",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30_000))
+  }
+
+  const attempts = waitForRebuild ? 8 : 4
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const schema = await readSchema()
+    available = schema.available
+    if (schema.ready) {
       emit({
         type: "log",
         level: "success",
@@ -905,7 +935,7 @@ async function reloadCreatedSchema(
       })
       return available
     }
-    await new Promise((resolve) => setTimeout(resolve, 1500))
+    await new Promise((resolve) => setTimeout(resolve, 3_000))
   }
 
   const missingTypes = [...projectTypes, ...taskTypes]
