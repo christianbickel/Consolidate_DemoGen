@@ -1,8 +1,15 @@
+import type { Metadata } from "next"
 import { Geist, Geist_Mono } from "next/font/google"
 
 import "./globals.css"
 import { ThemeProvider } from "@/components/theme-provider"
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils"
+
+export const metadata: Metadata = {
+  title: "Consolidate Demodaten",
+  description:
+    "Branchenspezifische Demodaten erzeugen und in eine Consolidate-Instanz schreiben.",
+}
 
 const geist = Geist({subsets:['latin'],variable:'--font-sans'})
 
@@ -18,7 +25,7 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
+      lang="de"
       suppressHydrationWarning
       className={cn("antialiased", fontMono.variable, "font-sans", geist.variable)}
     >

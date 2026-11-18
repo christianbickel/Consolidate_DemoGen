@@ -1,21 +1,15 @@
-# Next.js template
+# Consolidate Demodaten
 
-This is a Next.js template with shadcn/ui.
+Web-Anwendung, mit der Vertrieb und Consulting branchenspezifische Demodaten in eine Consolidate-Instanz schreiben.
 
-## Adding components
-
-To add components to your app, run the following command:
+## Start
 
 ```bash
-npx shadcn@latest add button
+npm install
+cp .env.example .env.local
+npm run dev
 ```
 
-This will place the ui components in the `components` directory.
+`OPENAI_API_KEY` kann in `.env.local` stehen oder im Formular eingegeben werden. Optional setzt `OPENAI_MODEL` das Modell, Standard ist `gpt-4o-mini`.
 
-## Using components
-
-To use the components in your app, import them as follows:
-
-```tsx
-import { Button } from "@/components/ui/button";
-```
+Die Anmeldung verwendet Benutzername und Passwort der Instanz. Die Sitzung bleibt als Cookie auf diesem Server.
