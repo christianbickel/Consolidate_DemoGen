@@ -19,9 +19,9 @@ const FEMALE = new Set(
 )
 
 const SALUTATION_WORDS: Record<PersonGender, string[]> = {
-  male: ["herr", "mr", "mister", "male", "männlich", "mann"],
-  female: ["frau", "mrs", "ms", "miss", "female", "weiblich"],
-  neutral: ["neutral", "divers", "diverse", "mx", "non-binary", "nonbinary"],
+  male: ["herr", "mr", "mister", "male", "male_form", "männlich", "mann"],
+  female: ["frau", "mrs", "ms", "miss", "female", "female_form", "weiblich"],
+  neutral: ["neutral", "neutral_form", "divers", "diverse", "mx", "non-binary", "nonbinary"],
 }
 
 export function inferPersonGender(firstName: string): PersonGender {
@@ -51,10 +51,10 @@ export function genderAdjective(gender: PersonGender): string {
   return "neutrales"
 }
 
-export function matchSalutationId(
+export function matchSalutationValue(
   options: { id: number; value: string }[],
   gender: PersonGender
-): number | undefined {
+): string | undefined {
   const words = SALUTATION_WORDS[gender]
   const found = options.find((option) => {
     const value = option.value.trim().toLowerCase().replace(/\.$/, "")
@@ -62,5 +62,13 @@ export function matchSalutationId(
       (word) => value === word || value.startsWith(`${word} `) || value.startsWith(`${word} (`)
     )
   })
-  return found?.id
+  return found?.value
+}
+
+export function matchSalutationId(
+  options: { id: number; value: string }[],
+  gender: PersonGender
+): number | undefined {
+  const value = matchSalutationValue(options, gender)
+  return options.find((option) => option.value === value)?.id
 }

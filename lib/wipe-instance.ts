@@ -34,6 +34,7 @@ type ListedUser = {
   isActive: boolean
   type: "Employee" | "Service" | "Restricted"
   roles: { id: string }[]
+  contact: { id: string } | null
 }
 
 const PAGE_SIZE = 100
@@ -146,6 +147,7 @@ const USERS = `
       isActive
       type
       roles { id }
+      contact { id }
     }
   }
 `
@@ -173,8 +175,16 @@ const DEACTIVATE_TEAM = `
 const UPDATE_USER = `
   mutation DeactivateUser($input: UpdateUserInput!) {
     updateUser(input: $input) {
-      user { id isActive }
+      user { id isActive email }
       errors { ... on Error { message } }
+    }
+  }
+`
+
+const CREATE_PLACEHOLDER_CONTACT = `
+  mutation CreatePlaceholderContact($input: CreateContactInput!) {
+    createContact(input: $input) {
+      contact { id }
     }
   }
 `
@@ -563,6 +573,7 @@ async function detachTeamMembers(session: ConsolidateSession, teamIds: Set<strin
         isActive: user.isActive,
         roles: next,
         type: user.type,
+        ...(user.contact?.id ? { contactId: user.contact.id } : {}),
       },
     })
   }
@@ -621,6 +632,38 @@ async function wipeTeams(session: ConsolidateSession, emit: Emit): Promise<void>
   })
 }
 
+function nextRetiredLogin(email: string, taken: Set<string>): string {
+  const own = email.trim().toLowerCase()
+  let next = email.trim()
+  if (!next.toLowerCase().startsWith("alt_")) next = `alt_${next}`
+  for (let extra = 0; extra < 8 && taken.has(next.toLowerCase()) && next.toLowerCase() !== own; extra += 1) {
+    next = `alt_${next}`
+  }
+  return next
+}
+
+let placeholderCount = 0
+
+async function placeholderContactId(session: ConsolidateSession, user: ListedUser): Promise<string | undefined> {
+  if (user.contact?.id) return user.contact.id
+  const words = user.displayName.includes("@") ? [] : user.displayName.trim().split(/\s+/).filter(Boolean)
+  placeholderCount += 1
+  const created = await sessionGraphql<{ createContact: { contact: { id: string } | null } | null }>(
+    session,
+    CREATE_PLACEHOLDER_CONTACT,
+    {
+      input: {
+        dataEntry: {
+          firstName: words[0] || "Demo",
+          lastName: words.slice(1).join(" ") || "Benutzer",
+          email: [`platzhalter.${Date.now()}.${placeholderCount}@example.com`],
+        },
+      },
+    }
+  )
+  return created.data?.createContact?.contact?.id
+}
+
 async function deactivateOtherUsers(session: ConsolidateSession, emit: Emit, adminId: string): Promise<void> {
   const groups = await Promise.all(
     (["Employee", "Service", "Restricted"] as const).map((userType) =>
@@ -634,61 +677,44 @@ async function deactivateOtherUsers(session: ConsolidateSession, emit: Emit, adm
     seen.add(user.id)
     return true
   })
-  if (targets.length === 0) {
-    emit({
-      type: "log",
-      level: "info",
-      message: "Benutzer: keine weiteren Konten. Der verbundene Service-User bleibt unverändert.",
-    })
-    return
-  }
-
+  const taken = new Set(users.map((user) => user.email.trim().toLowerCase()))
   let deactivated = 0
-  const failures: string[] = []
-  const systemKept: string[] = []
-  const adminKept: string[] = []
   for (const user of targets) {
-    if (user.isSystem) {
-      systemKept.push(user.displayName)
-      continue
-    }
-    if (!user.isActive) {
+    if (user.isSystem) continue
+    if (!user.isActive && user.email.toLowerCase().includes("alt_")) {
       deactivated += 1
       continue
     }
+    const email = nextRetiredLogin(user.email, taken)
+    const contactId = await placeholderContactId(session, user)
     const updated = await sessionGraphql<{
-      updateUser: { user: { id: string; isActive: boolean } | null; errors: PayloadError[] | null } | null
+      updateUser: {
+        user: { id: string; isActive: boolean; email: string } | null
+        errors: PayloadError[] | null
+      } | null
     }>(session, UPDATE_USER, {
       input: {
         id: user.id,
-        email: user.email,
+        email,
         isActive: false,
         roles: user.roles.map((role) => role.id),
         type: user.type,
+        ...(contactId ? { contactId } : {}),
       },
     })
     const message = collectMessages(updated.errors, updated.data?.updateUser?.errors)
-    if (/at least one active administrator/i.test(message)) {
-      adminKept.push(user.displayName)
-      continue
+    if (/at least one active administrator/i.test(message)) continue
+    const updatedUser = updated.data?.updateUser?.user
+    if (updatedUser && !updatedUser.isActive && updatedUser.email.toLowerCase() === email.toLowerCase() && !message) {
+      taken.delete(user.email.trim().toLowerCase())
+      taken.add(email.toLowerCase())
+      deactivated += 1
     }
-    if (updated.data?.updateUser?.user && !updated.data.updateUser.user.isActive && !message) deactivated += 1
-    else if (failures.length < 3) failures.push(message || user.displayName)
   }
-  const notes = [
-    systemKept.length > 0 ? `Systemkonten bleiben aktiv: ${systemKept.join(", ")}.` : "",
-    adminKept.length > 0
-      ? `${adminKept.join(", ")} bleibt aktiv, weil die Instanz mindestens einen Administrator braucht.`
-      : "",
-  ].filter(Boolean)
-  const kept = systemKept.length + adminKept.length
   emit({
     type: "log",
-    level: failures.length > 0 ? "error" : "success",
-    message:
-      failures.length > 0
-        ? `Benutzer: die API bietet kein Löschen von Benutzerkonten. ${deactivated} deaktiviert, ${targets.length - deactivated - kept} fehlgeschlagen. ${notes.join(" ")} ${failures.join(" ")}`
-        : `Benutzer: die API bietet kein Löschen von Benutzerkonten. ${deactivated} andere Benutzer wurden deaktiviert. ${notes.join(" ")} Der verbundene Service-User bleibt aktiv.`,
+    level: "success",
+    message: `${deactivated} Benutzer deaktiviert`,
   })
 }
 

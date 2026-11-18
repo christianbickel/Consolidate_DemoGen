@@ -616,7 +616,7 @@ Today is ${today}.
 Create exactly ${preset.appointments} appointments: kickoffs, milestone reviews, customer meetings or site visits that fit this industry.
 Projects: ${projectCatalog}.
 Attendees are zero-based employee indexes: ${employees.map((employee, index) => `${index}=${employee.firstName} ${employee.lastName}`).join("; ")}.
-startDate is a weekday. About one in five appointments is in the last 21 days, the rest are within the next 21 days. startTime and endTime are HH:mm between 08:00 and 17:00. The meeting lasts 30 to 90 minutes.
+startDate is a weekday from Monday to Friday. Never use Saturday or Sunday. About one in five appointments is in the last 21 days, the rest are within the next 21 days. startTime and endTime are HH:mm between 08:00 and 17:00. The meeting lasts 30 to 90 minutes.
 location is a realistic room, plant or customer site in ${languageName(request.language)}.`,
         },
       ]

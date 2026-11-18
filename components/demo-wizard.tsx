@@ -503,7 +503,7 @@ export function DemoWizard() {
                   disabled={busy !== null || profile.trim().length < 20}
                 >
                   {busy === "generate" ? <Spinner data-icon="inline-start" /> : null}
-                  Vorschau neu erzeugen
+                  Demodaten erzeugen
                 </Button>
                 <Button type="button" onClick={importPlan} disabled={busy !== null || !plan}>
                   {busy === "import" ? <Spinner data-icon="inline-start" /> : null}
@@ -520,35 +520,6 @@ export function DemoWizard() {
                 </Field>
               </CardFooter>
             </Card>
-
-            {plan ? (
-              <Card>
-                <CardHeader>
-                  <CardTitle>Vorschau</CardTitle>
-                  <CardDescription>
-                    {plan.projectTypes.length} Projekt-Typen, {plan.taskTypes.length} Aufgaben-Typen,{" "}
-                    {plan.companies.length} Unternehmen, {plan.contacts.length} Kontakte, {plan.teams.length}{" "}
-                    Teams, {plan.employees.length} Mitarbeiter, {plan.projects.length} Projekte,{" "}
-                    {plan.tasks.length} Aufgaben, {plan.appointments.length} Termine.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <PlanPreview
-                    plan={plan}
-                    adminName={session?.displayName || session?.username || "Verbundener Service-User"}
-                  />
-                </CardContent>
-              </Card>
-            ) : (
-              <Empty>
-                <EmptyHeader>
-                  <EmptyTitle>Noch keine Vorschau</EmptyTitle>
-                  <EmptyDescription>
-                    Erzeuge die Daten aus dem Kundenprofil. Der Import startet erst nach der Prüfung.
-                  </EmptyDescription>
-                </EmptyHeader>
-              </Empty>
-            )}
 
             {summary ? (
               <Card>
@@ -583,7 +554,34 @@ export function DemoWizard() {
                   </Button>
                 </CardContent>
               </Card>
-            ) : null}
+            ) : plan ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Vorschau</CardTitle>
+                  <CardDescription>
+                    {plan.projectTypes.length} Projekt-Typen, {plan.taskTypes.length} Aufgaben-Typen,{" "}
+                    {plan.companies.length} Unternehmen, {plan.contacts.length} Kontakte, {plan.teams.length}{" "}
+                    Teams, {plan.employees.length} Mitarbeiter, {plan.projects.length} Projekte,{" "}
+                    {plan.tasks.length} Aufgaben, {plan.appointments.length} Termine.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <PlanPreview
+                    plan={plan}
+                    adminName={session?.displayName || session?.username || "Verbundener Service-User"}
+                  />
+                </CardContent>
+              </Card>
+            ) : (
+              <Empty>
+                <EmptyHeader>
+                  <EmptyTitle>Noch keine Vorschau</EmptyTitle>
+                  <EmptyDescription>
+                    Erzeuge die Daten aus dem Kundenprofil. Der Import startet erst nach der Prüfung.
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            )}
           </div>
         ) : null}
       </main>

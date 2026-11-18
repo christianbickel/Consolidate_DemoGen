@@ -321,11 +321,13 @@ export function balanceAppointmentDates(appointments: DemoPlan["appointments"], 
     for (const index of evenIndexes(future.length, target - pastIndexes.size)) pastIndexes.add(future[index])
   }
   appointments.forEach((appointment, index) => {
-    appointment.startDate = pastIndexes.has(index)
+    const past = pastIndexes.has(index)
+    const date = past
       ? recentPastDay(today, index)
       : appointment.startDate > today
         ? appointment.startDate
         : upcomingWeekday(today, index)
+    appointment.startDate = shiftToWeekday(date, past ? -1 : 1)
   })
 }
 
