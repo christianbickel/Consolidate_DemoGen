@@ -885,6 +885,33 @@ const CREATE_USER = `
   }
 `
 
+const LIST_EMPLOYEES = `
+  query ListEmployees($userType: UserType!) {
+    allUsers(userType: $userType) {
+      id
+      email
+      displayName
+      isActive
+      isSystem
+    }
+  }
+`
+
+const UPDATE_EMPLOYEE = `
+  mutation ReactivateEmployee($input: UpdateUserInput!) {
+    updateUser(input: $input) {
+      user {
+        id
+        email
+        displayName
+        isActive
+        securityTemplate { ${SECURITY_TEMPLATE_FIELDS} }
+      }
+      errors { ... on Error { message } }
+    }
+  }
+`
+
 const EDIT_SECURITY_TEMPLATE = `
   mutation EditSecurityTemplate($input: EditSecurityTemplateInput!) {
     editSecurityTemplate(input: $input) {
@@ -1113,6 +1140,24 @@ async function grantAdminManage(
   }
 }
 
+export type ExistingEmployee = {
+  id: string
+  email: string
+  displayName: string
+  isActive: boolean
+  isSystem: boolean
+}
+
+export async function listEmployees(session: ConsolidateSession): Promise<ExistingEmployee[]> {
+  const result = await sessionGraphql<{ allUsers: ExistingEmployee[] }>(session, LIST_EMPLOYEES, {
+    userType: "Employee",
+  })
+  if (result.errors?.length && !result.data?.allUsers) {
+    throw new Error(collectMessages(result.errors) || "Die Mitarbeiter konnten nicht gelesen werden.")
+  }
+  return result.data?.allUsers ?? []
+}
+
 export async function createEmployee(
   session: ConsolidateSession,
   input: {
@@ -1122,8 +1167,48 @@ export async function createEmployee(
     roleIds: string[]
     adminUserId: string
     readerRoleIds?: string[]
+    existing?: ExistingEmployee
   }
-): Promise<{ id: string; email: string; displayName: string }> {
+): Promise<{ id: string; email: string; displayName: string; reactivated: boolean; reused: boolean }> {
+  if (input.existing && !input.existing.isSystem && input.existing.id !== input.adminUserId) {
+    const result = await sessionGraphql<{
+      updateUser: {
+        user: {
+          id: string
+          email: string
+          displayName: string
+          isActive: boolean
+          securityTemplate: SecurityRule[] | null
+        } | null
+        errors: PayloadError[] | null
+      } | null
+    }>(session, UPDATE_EMPLOYEE, {
+      input: {
+        id: input.existing.id,
+        email: input.email,
+        password: input.password,
+        isActive: true,
+        requirePasswordChange: false,
+        roles: input.roleIds,
+        type: "Employee",
+        ...(input.contactId ? { contactId: input.contactId } : {}),
+      },
+    })
+    const user = result.data?.updateUser?.user
+    const message = collectMessages(result.errors, result.data?.updateUser?.errors)
+    if (!user?.isActive) {
+      throw new Error(message || "Der vorhandene Mitarbeiter konnte nicht aktiviert werden.")
+    }
+    await grantAdminManage(
+      session,
+      user.id,
+      input.adminUserId,
+      user.securityTemplate,
+      input.readerRoleIds ?? []
+    )
+    return { ...user, reactivated: !input.existing.isActive, reused: true }
+  }
+
   const result = await sessionGraphql<{
     createUser: {
       user: {
@@ -1155,7 +1240,7 @@ export async function createEmployee(
     user.securityTemplate,
     input.readerRoleIds ?? []
   )
-  return user
+  return { ...user, reactivated: false, reused: false }
 }
 
 const CREATE_PROJECT = `

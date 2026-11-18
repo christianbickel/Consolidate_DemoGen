@@ -16,6 +16,7 @@ import {
   createTaskStatus,
   createTeam,
   errorText,
+  listEmployees,
   loadImportContext,
   loadDynamicSchema,
   loadSalutationOptions,
@@ -421,6 +422,12 @@ export async function importDemoPlan(
 
   const people: CreatedPerson[] = []
   let licenseReached = false
+  const existingEmployees = await listEmployees(session)
+  const employeesByEmail = new Map(
+    existingEmployees.flatMap((user) =>
+      user.email ? [[user.email.trim().toLowerCase(), user] as const] : []
+    )
+  )
   for (const [index, employee] of plan.employees.entries()) {
     const teamId = teamIds[employee.teamIndex] || teamIds.find(Boolean) || ""
     const roleIds = [defaultRole?.id, teamId].filter((id): id is string => Boolean(id))
@@ -453,6 +460,7 @@ export async function importDemoPlan(
           message: `Kontakt ${employee.firstName} ${employee.lastName} fehlgeschlagen, Benutzer wird ohne Kontakt angelegt: ${errorText(error)}`,
         })
       }
+      const existing = employeesByEmail.get(employee.email.trim().toLowerCase())
       const user = await createEmployee(session, {
         email: employee.email,
         password: DEMO_PASSWORD,
@@ -460,13 +468,25 @@ export async function importDemoPlan(
         roleIds: Array.from(new Set(roleIds)),
         adminUserId: context.me.user.id,
         readerRoleIds,
+        existing,
       })
       people.push({ id: user.id, teamIndex: employee.teamIndex })
       summary.employees += 1
+      employeesByEmail.set(employee.email.trim().toLowerCase(), {
+        id: user.id,
+        email: user.email,
+        displayName: user.displayName,
+        isActive: true,
+        isSystem: false,
+      })
       emit({
         type: "log",
         level: avatarFailed ? "error" : "success",
-        message: `Mitarbeiter „${employee.firstName} ${employee.lastName}“ angelegt (ID: ${user.id}). Der verbundene Service-User hat Manage-Recht.${avatarNote}`,
+        message: user.reactivated
+          ? `Mitarbeiter „${employee.firstName} ${employee.lastName}“ war bereits vorhanden und wurde wieder aktiviert (ID: ${user.id}).${avatarNote}`
+          : user.reused
+            ? `Mitarbeiter „${employee.firstName} ${employee.lastName}“ ist bereits aktiv und wird verwendet (ID: ${user.id}).${avatarNote}`
+            : `Mitarbeiter „${employee.firstName} ${employee.lastName}“ angelegt (ID: ${user.id}). Der verbundene Service-User hat Manage-Recht.${avatarNote}`,
       })
     } catch (error) {
       people.push({ id: "", teamIndex: employee.teamIndex })
