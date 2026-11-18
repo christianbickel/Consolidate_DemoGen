@@ -1339,7 +1339,13 @@ export async function createTaskRecord(
 const TASK_FILE_STATE = `
   id
   changeVector
-  attachments { id name isVersioned versionCount }
+  attachments {
+    id
+    name
+    isVersioned
+    versionCount
+    fileVersionHistory { versionNumber status }
+  }
 `
 
 const UPDATE_TASK_FILE = `
@@ -1380,7 +1386,23 @@ const APPROVE_DRAFT = `
 type TaskFileState = {
   id: string
   changeVector?: string | null
-  attachments: { id: string; name: string; isVersioned: boolean; versionCount: number }[]
+  attachments: {
+    id: string
+    name: string
+    isVersioned: boolean
+    versionCount: number
+    fileVersionHistory?: { versionNumber: number; status: string }[] | null
+  }[]
+}
+
+const TASK_FILE = `
+  query TaskFile($id: ID!) {
+    dataEntry(id: $id) { ... on Task { ${TASK_FILE_STATE} } }
+  }
+`
+
+function fileHasDraft(attachment: TaskFileState["attachments"][number] | undefined): boolean {
+  return (attachment?.fileVersionHistory ?? []).some((version) => version.status === "Draft")
 }
 
 const CURRENT_CHANGE_VECTOR = `
@@ -1388,6 +1410,11 @@ const CURRENT_CHANGE_VECTOR = `
     dataEntry(id: $id) { changeVector }
   }
 `
+
+async function readTaskFile(session: ConsolidateSession, id: string): Promise<TaskFileState | null> {
+  const result = await sessionGraphql<{ dataEntry: TaskFileState | null }>(session, TASK_FILE, { id })
+  return result.data?.dataEntry ?? null
+}
 
 async function readChangeVector(session: ConsolidateSession, id: string): Promise<string | undefined> {
   const result = await sessionGraphql<{ dataEntry: { changeVector?: string | null } | null }>(
@@ -1495,39 +1522,7 @@ export async function attachTaskFile(
   }
   changeVector = history.data?.createVersionHistory?.dataEntry?.changeVector ?? changeVector
 
-  for (let index = 1; index < input.versions.length; index += 1) {
-    const drafted = await runWithChangeVector(session, input.taskId, changeVector, async (vector) => {
-      const draft = await sessionGraphqlUpload<{
-        createDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
-      }>(
-        session,
-        CREATE_DRAFT,
-        {
-          input: {
-            dataEntryId: input.taskId,
-            attachmentId: attachment.id,
-            newFile: null,
-            ...(vector ? { changeVector: vector } : {}),
-          },
-        },
-        [
-          {
-            path: "variables.input.newFile",
-            filename: input.fileName,
-            contentType: input.contentType,
-            body: input.versions[index],
-          },
-        ]
-      )
-      const message = collectMessages(draft.errors, draft.data?.createDraft?.errors)
-      const entry = isChangeConflict(message) ? undefined : draft.data?.createDraft?.dataEntry ?? undefined
-      return {
-        ok: Boolean(entry),
-        message: message || (entry ? "" : `Version ${index + 1} wurde nicht angelegt.`),
-        value: entry,
-      }
-    })
-    changeVector = drafted.vector
+  const approveDraft = async (comment: string) => {
     const approved = await runWithChangeVector(session, input.taskId, changeVector, async (vector) => {
       const result = await sessionGraphql<{
         approveDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
@@ -1535,7 +1530,7 @@ export async function attachTaskFile(
         input: {
           dataEntryId: input.taskId,
           attachmentId: attachment.id,
-          comment: `Version ${index + 1}`,
+          comment,
           ...(vector ? { changeVector: vector } : {}),
         },
       })
@@ -1543,16 +1538,71 @@ export async function attachTaskFile(
       const entry = isChangeConflict(message) ? undefined : result.data?.approveDraft?.dataEntry ?? undefined
       return {
         ok: Boolean(entry),
-        message: message || (entry ? "" : `Version ${index + 1} wurde nicht freigegeben.`),
+        message: message || (entry ? "" : `${comment} wurde nicht freigegeben.`),
         value: entry,
       }
     })
     changeVector = approved.vector
-    const count = approved.value.attachments?.find((item) => item.id === attachment.id)?.versionCount
-    if (index === input.versions.length - 1) return { versionCount: count || input.versions.length }
+    return approved.value
   }
 
-  return { versionCount: input.versions.length }
+  const current = history.data?.createVersionHistory?.dataEntry ?? (await readTaskFile(session, input.taskId))
+  const currentFile = current?.attachments?.find((item) => item.id === attachment.id)
+  if (fileHasDraft(currentFile)) {
+    await approveDraft("Version 1")
+  }
+
+  let versionCount = currentFile?.versionCount || 1
+  for (let index = 1; index < input.versions.length; index += 1) {
+    const comment = `Version ${index + 1}`
+    const createNextDraft = () =>
+      runWithChangeVector(session, input.taskId, changeVector, async (vector) => {
+        const draft = await sessionGraphqlUpload<{
+          createDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
+        }>(
+          session,
+          CREATE_DRAFT,
+          {
+            input: {
+              dataEntryId: input.taskId,
+              attachmentId: attachment.id,
+              newFile: null,
+              ...(vector ? { changeVector: vector } : {}),
+            },
+          },
+          [
+            {
+              path: "variables.input.newFile",
+              filename: input.fileName,
+              contentType: input.contentType,
+              body: input.versions[index],
+            },
+          ]
+        )
+        const message = collectMessages(draft.errors, draft.data?.createDraft?.errors)
+        const entry = isChangeConflict(message) ? undefined : draft.data?.createDraft?.dataEntry ?? undefined
+        return {
+          ok: Boolean(entry),
+          message: message || (entry ? "" : `${comment} wurde nicht angelegt.`),
+          value: entry,
+        }
+      })
+
+    let drafted: Awaited<ReturnType<typeof createNextDraft>>
+    try {
+      drafted = await createNextDraft()
+    } catch (error) {
+      if (!/OnlyOneDraft/i.test(errorText(error))) throw error
+      await approveDraft(`Version ${index}`)
+      drafted = await createNextDraft()
+    }
+    changeVector = drafted.vector
+    const approved = await approveDraft(comment)
+    versionCount =
+      approved.attachments.find((item) => item.id === attachment.id)?.versionCount || index + 1
+  }
+
+  return { versionCount }
 }
 
 const CREATE_STATUS = `
