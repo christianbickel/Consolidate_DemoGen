@@ -1220,7 +1220,7 @@ export async function createProject(
       dataEntry = next
       continue
     }
-    if (typeName && /type|enum|ProjectTypes/i.test(lastMessage)) {
+    if (typeName && /type|enum|ProjectTypes|ValueNotAllowed/i.test(lastMessage)) {
       typeName = undefined
       continue
     }
@@ -1282,6 +1282,17 @@ export async function createTaskRecord(
       fieldsApplied: false,
     })
   }
+  variants.push({
+    dataEntry: {
+      subject: input.subject,
+      status: input.fallbackStatusId || input.statusId,
+      priority: input.priority,
+      startDate: input.startDate,
+      dueDate: input.dueDate,
+      description: baseEntry.description,
+    },
+    fieldsApplied: false,
+  })
 
   let securityRules = input.securityRules
   const post = (dataEntry: Record<string, unknown>, typeName?: string) =>
@@ -1307,9 +1318,18 @@ export async function createTaskRecord(
       }
     }
     lastMessage = collectMessages(result.errors) || lastMessage
-    if (securityRules && /securityRules/i.test(lastMessage)) {
+    if (securityRules && /securityRules|ValueNotAllowed/i.test(lastMessage)) {
       securityRules = undefined
-      continue
+      const retry = await post(variant.dataEntry, variant.typeName)
+      const retried = retry.data?.createTask?.task
+      if (retried) {
+        return {
+          ...retried,
+          linkedType: Boolean(variant.typeName),
+          fieldsApplied: variant.fieldsApplied,
+        }
+      }
+      lastMessage = collectMessages(retry.errors) || lastMessage
     }
     if (!/ValueNotAllowed|UnknownField|service user|type|enum|TaskTypes|not allowed/i.test(lastMessage)) break
   }

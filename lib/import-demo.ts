@@ -16,7 +16,6 @@ import {
   createTaskStatus,
   createTeam,
   errorText,
-  grantDataEntrySecurity,
   loadImportContext,
   loadDynamicSchema,
   loadSalutationOptions,
@@ -230,7 +229,14 @@ export async function importDemoPlan(
     tick("Aufgaben-Typen")
   }
 
-  const taskInputFields = await reloadCreatedSchema(session, plan, projectTypes, taskTypes, emit)
+  let taskInputFields = await reloadCreatedSchema(
+    session,
+    plan,
+    projectTypes,
+    taskTypes,
+    emit,
+    "Schema wird neu geladen."
+  )
 
   const defaultRole =
     context.roles.find((role) => role.isDefault && !role.isSystemRole) ??
@@ -305,15 +311,6 @@ export async function importDemoPlan(
     emit,
     "Aufgaben"
   )
-  const appointmentSecurity = await readerSecurity(
-    session,
-    findCollection(context.dataForms, ["appointment", "appointments", "termin", "termine"]),
-    context.me.user.id,
-    readerRoleIds,
-    emit,
-    "Termin"
-  )
-
   const companyIds: string[] = []
   const contactsByCompany = plan.companies.map(() => [] as { id: string; name: string }[])
   for (const [companyIndex, company] of plan.companies.entries()) {
@@ -492,6 +489,14 @@ export async function importDemoPlan(
   }
 
   const { statuses, columnsByType } = await ensureStatuses(session, context, plan, taskTypes, emit)
+  taskInputFields = await reloadCreatedSchema(
+    session,
+    plan,
+    projectTypes,
+    taskTypes,
+    emit,
+    "Schema wird vor den Projekten erneut geprüft."
+  )
   const projectIds: string[] = []
   for (const project of plan.projects) {
     const manager = people[project.managerIndex]
@@ -546,6 +551,14 @@ export async function importDemoPlan(
     tick("Projekte")
   }
 
+  taskInputFields = await reloadCreatedSchema(
+    session,
+    plan,
+    projectTypes,
+    taskTypes,
+    emit,
+    "Schema wird vor den Aufgaben erneut geprüft."
+  )
   const serviceUser = context.me.user.type === "Service"
   if (serviceUser && plan.tasks.some((task) => task.assignToAdmin)) {
     emit({
@@ -749,17 +762,6 @@ export async function importDemoPlan(
         level: "success",
         message: `Termin „${created.title}“ angelegt (ID: ${created.id}).`,
       })
-      if (created.appointmentId && appointmentSecurity) {
-        try {
-          await grantDataEntrySecurity(session, created.appointmentId, appointmentSecurity)
-        } catch (error) {
-          emit({
-            type: "log",
-            level: "error",
-            message: `Leserecht für „${created.title}“ fehlgeschlagen: ${errorText(error)}`,
-          })
-        }
-      }
       if (created.appointmentId && projectId) {
         try {
           await associateRecords(session, created.appointmentId, projectId)
@@ -867,7 +869,8 @@ async function reloadCreatedSchema(
   plan: DemoPlan,
   projectTypes: CreatedType[],
   taskTypes: CreatedType[],
-  emit: (event: StreamEvent) => void
+  emit: (event: StreamEvent) => void,
+  message: string
 ): Promise<Set<string>> {
   const created = [...projectTypes, ...taskTypes].filter((type) => type.key)
   const expectedFields = plan.taskTypes.flatMap((type, index) =>
@@ -875,7 +878,7 @@ async function reloadCreatedSchema(
   )
   if (created.length === 0 && expectedFields.length === 0) return new Set()
 
-  emit({ type: "log", level: "info", message: "Schema wird neu geladen." })
+  emit({ type: "log", level: "info", message })
   let available = new Set<string>()
   for (let attempt = 0; attempt < 12; attempt += 1) {
     const schema = await loadDynamicSchema(session)
@@ -1017,6 +1020,28 @@ async function ensureStatuses(
       }
     }
   }
+  if (!statuses.some((status) => status.availableInTypes.length === 0)) {
+    const globalName = plan.language === "de" ? "Allgemein" : "General"
+    try {
+      const status = await createTaskStatus(session, {
+        name: globalName,
+        category: "Todo",
+        availableInTypes: [],
+      })
+      statuses.push({ ...status, availableInTypes: [] })
+      emit({
+        type: "log",
+        level: "success",
+        message: `Status „${status.name}“ gilt für alle Aufgaben (ID: ${status.id}).`,
+      })
+    } catch (error) {
+      emit({
+        type: "log",
+        level: "error",
+        message: `Allgemeiner Aufgabenstatus fehlgeschlagen: ${errorText(error)}`,
+      })
+    }
+  }
   return { statuses, columnsByType }
 }
 
@@ -1068,13 +1093,14 @@ function pickStatus(
     const sameCategory = typeColumns.filter((status) => status.category === task.statusCategory)
     return sameCategory[0] ?? typeColumns[0]
   }
+  const globalStatus = statuses.find((status) => status.availableInTypes.length === 0)
   const pool = statuses.filter((status) => status.category === task.statusCategory)
   const allowed = pool.filter(
     (status) =>
       status.availableInTypes.length === 0 ||
       (typeKey ? status.availableInTypes.includes(typeKey) : false)
   )
-  return allowed[0] ?? pool[0] ?? statuses[0]
+  return allowed[0] ?? globalStatus ?? pool[0] ?? statuses[0]
 }
 
 async function resolveCalendar(
