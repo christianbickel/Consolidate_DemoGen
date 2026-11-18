@@ -515,26 +515,31 @@ async function wipeTypes(
     emit({ type: "log", level: "error", message: `${label}: Formular wurde nicht gefunden.` })
     return
   }
-  const deletable = form.types.filter((type) => type.canBeDeleted)
-  const protectedCount = form.types.length - deletable.length
+  const deletable = form.types.filter((type) => !type.archived)
   let removed = 0
   const failures: string[] = []
+  const kept: string[] = []
   for (const type of deletable) {
     const deleted = await sessionGraphql<{
       deleteDataType: { success: boolean | null; errors: PayloadError[] | null } | null
     }>(session, DELETE_TYPE, { input: { dataCollection: form.dataCollection, key: type.key } })
     const message = collectMessages(deleted.errors, deleted.data?.deleteDataType?.errors)
-    if (deleted.data?.deleteDataType?.success && !message) removed += 1
-    else if (failures.length < 3) failures.push(message || type.displayName)
+    if (deleted.data?.deleteDataType?.success && !message) {
+      removed += 1
+      continue
+    }
+    if (type.canBeDeleted) failures.push(`${type.displayName}: ${message || "Löschen wurde abgelehnt."}`)
+    else kept.push(type.displayName)
   }
-  const protectedNote = protectedCount > 0 ? ` ${protectedCount} geschützte Typen bleiben bestehen.` : ""
+  const keptNote =
+    kept.length > 0 ? ` ${kept.length} geschützte Typen bleiben bestehen: ${kept.join(", ")}.` : ""
   emit({
     type: "log",
-    level: failures.length > 0 || protectedCount > 0 ? "error" : "success",
+    level: failures.length > 0 ? "error" : "success",
     message:
       failures.length > 0
-        ? `${label}: ${removed} entfernt, ${deletable.length - removed} fehlgeschlagen.${protectedNote} ${failures.join(" ")}`
-        : `${label}: ${removed} entfernt.${protectedNote}`,
+        ? `${label}: ${removed} entfernt, ${failures.length} fehlgeschlagen.${keptNote} ${failures.join(" ")}`
+        : `${label}: ${removed} entfernt.${keptNote}`,
   })
 }
 
@@ -758,13 +763,19 @@ export async function wipeDemoInstance(session: ConsolidateSession, emit: Emit):
   await wipeTeams(session, emit)
 
   progress(7, "Aufgaben-Typen werden entfernt")
-  await wipeTypes(session, emit, findForm(forms, ["task", "tasks", "aufgabe", "aufgaben"]), "Aufgaben-Typen")
+  const typesAfterEntries = (await readData<{ dataForms: DataForm[] }>(session, FORMS)).dataForms
+  await wipeTypes(
+    session,
+    emit,
+    findForm(typesAfterEntries, ["task", "tasks", "aufgabe", "aufgaben"]),
+    "Aufgaben-Typen"
+  )
 
   progress(8, "Projekt-Typen werden entfernt")
   await wipeTypes(
     session,
     emit,
-    findForm(forms, ["project", "projects", "projekt", "projekte"]),
+    findForm(typesAfterEntries, ["project", "projects", "projekt", "projekte"]),
     "Projekt-Typen"
   )
 
