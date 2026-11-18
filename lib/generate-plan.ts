@@ -4,6 +4,10 @@ import { z } from "zod"
 
 import {
   addDays,
+  assignAdminOwners,
+  balanceAppointmentDates,
+  balanceProjectDates,
+  balanceTaskDates,
   clampIndex,
   todayInBerlin,
   uniqueCompanyEmail,
@@ -60,7 +64,7 @@ const companyShape = z.object({
   city: z.string(),
   country: z.string(),
   phone: z.string(),
-  note: z.string().describe("One sentence on why this company is a customer or partner of the ICP"),
+  note: z.string().describe("One sentence on why this company is a customer of the profiled company"),
 })
 
 const externalContactShape = z.object({
@@ -70,6 +74,7 @@ const externalContactShape = z.object({
   department: z.string(),
   companyIndex: z.number().int(),
   phone: z.string(),
+  gender: z.enum(["male", "female", "neutral"]),
 })
 
 const teamShape = z.object({
@@ -82,6 +87,7 @@ const employeeShape = z.object({
   lastName: z.string(),
   position: z.string(),
   teamIndex: z.number().int(),
+  gender: z.enum(["male", "female", "neutral"]),
 })
 
 const projectShape = z.object({
@@ -134,8 +140,8 @@ function languageName(language: GenerateRequest["language"]): string {
 function industryRules(profile: string, language: GenerateRequest["language"]): string {
   return [
     `Write every user-facing string strictly in ${languageName(language)}.`,
-    "The customer profile is the ideal customer profile (ICP).",
-    "Project types, task types, companies, contacts, teams, job titles, project titles, task subjects and appointments must match that industry and the way that company works.",
+    "The customer profile describes the company that uses Consolidate. Teams, employees, project types, task types, project titles, task subjects and appointments describe that company's own work.",
+    "External companies are typical customers of that company. They are not competitors, not other firms in the same profession, and not partner offices of the same trade.",
     "Do not use software-development labels such as Bug, User Story, Sprint or Epic unless the profile is a software company.",
     "Do not use placeholder names such as Project 1, Team A or Task type.",
     `Customer profile: ${profile}`,
@@ -191,9 +197,9 @@ export async function generateDemoPlan(
   emit: (event: StreamEvent) => void
 ): Promise<DemoPlan> {
   const preset = presetById(request.presetId)
-  const apiKey = request.apiKey?.trim() || process.env.OPENAI_API_KEY?.trim()
+  const apiKey = process.env.OPENAI_API_KEY?.trim()
   if (!apiKey) {
-    throw new Error("Kein OpenAI-API-Key. Trage ihn im Formular ein oder setze OPENAI_API_KEY.")
+    throw new Error("Kein OpenAI-API-Key. Setze OPENAI_API_KEY in der Umgebung.")
   }
 
   const client = new OpenAI({ apiKey })
@@ -284,13 +290,15 @@ Two task types must not share the same column names.`,
       {
         role: "system",
         content:
-          "You create fictional customer and partner companies for a Consolidate demo. Return only the schema. Never use real private persons.",
+          "You create fictional customer companies for a Consolidate demo. Return only the schema. Never use real private persons. Never create competitors of the profiled company.",
       },
       {
         role: "user",
         content: `${rules}
-Create exactly ${preset.companies} fictional companies that would buy from, partner with, or be served by the company in the profile.
-Company names must sound real for that industry and be written in ${languageName(request.language)}.
+Create exactly ${preset.companies} fictional companies that are typical customers of the company in the profile.
+Choose the industries those customers come from. A tax advisor's customers are B2B firms in trade, gastronomy and industry, not other tax advisors. A machine builder's customers are manufacturing plants, not other machine builders. A law firm's customers are businesses that hire counsel, not other law firms.
+Do not create companies in the same profession as the profiled company.
+Company names must sound like real businesses in the customer's own industry and be written in ${languageName(request.language)}.
 Addresses are fictional. For German, use German streets, postcodes and cities and country "Deutschland". For English, use English-speaking places and country "Germany" only if the profile is set in Germany, otherwise a matching country.
 phone is a fictional phone number, not a published real number.
 note explains the business relationship in one sentence.`,
@@ -335,7 +343,7 @@ note explains the business relationship in one sentence.`,
           {
             role: "system",
             content:
-              "You create fictional business contacts at customer companies. Return only the schema. These people are not employees of the ICP company.",
+              "You create fictional people who work at the profiled company's customers. Return only the schema. These people are not employees of the profiled company and do not work in that company's profession.",
           },
           {
             role: "user",
@@ -343,8 +351,9 @@ note explains the business relationship in one sentence.`,
 Create exactly ${count} fictional contacts. This is batch ${offset / CONTACT_BATCH + 1}.
 They work at these companies: ${companyCatalog}.
 companyIndex is zero-based and must point at one of those companies. Spread contacts across companies.
-position and department match the industry and are written in ${languageName(request.language)}.
+position and department are jobs at that customer company, written in ${languageName(request.language)}. A customer of a tax advisor can be a restaurant manager or a plant controller, not another tax advisor.
 Use realistic personal names in ${languageName(request.language)}.
+Set gender to match the first name: male, female, or neutral. Use neutral only when the name is commonly used for more than one gender.
 phone is a fictional number.`,
           },
         ]
@@ -358,6 +367,7 @@ phone is a fictional number.`,
           companyIndex: clampIndex(contact.companyIndex, companies.length),
           phone: contact.phone.trim(),
           email: uniqueEmail(contact.firstName, contact.lastName, usedEmails),
+          gender: contact.gender,
         })
       }
       emit({
@@ -396,6 +406,7 @@ Create exactly ${preset.teams} teams and ${preset.employees} employees.
 teamIndex is zero-based and must point at one of the teams.
 Spread employees across the teams.
 Use realistic personal names and industry job titles in ${languageName(request.language)}.
+Set gender to match the first name: male, female, or neutral. Use neutral only when the name is commonly used for more than one gender.
 These are internal employees of the ICP company, not the external customer contacts.
 Project types for context: ${types.projectTypes.map((type) => type.displayName).join(", ")}.
 Task types for context: ${taskTypes.map((type) => type.displayName).join(", ")}.`,
@@ -446,7 +457,7 @@ Task types: ${taskTypes
   })
   .join(" | ")}.
 Choose the task type whose stages match the project. Give every custom workflow at least one project when enough projects exist.
-startDate is on or after ${today} and within 30 days. endDate is 30 to 180 days after startDate. Format YYYY-MM-DD.
+About one in five projects has already finished: endDate is 2 to 18 days before ${today} and startDate is 40 to 90 days before that end. The other projects start on or after ${today}, within 30 days, and end 30 to 180 days later. Format YYYY-MM-DD.
 Project titles must sound like real engagements, not "Projekt 1".`,
     },
   ])
@@ -469,6 +480,7 @@ Project titles must sound like real engagements, not "Projekt 1".`,
     }),
     taskTypes
   )
+  balanceProjectDates(projects, today)
   emit({
     type: "log",
     level: "success",
@@ -482,7 +494,8 @@ Project titles must sound like real engagements, not "Projekt 1".`,
       const columns = type.statuses.length
         ? type.statuses.map((status) => `${status.name} (${status.category})`).join(" → ")
         : "default"
-      return `${index}=${project.name} (${project.startDate} bis ${project.endDate}); task type ${project.taskTypeIndex}=${type.displayName}; columns: ${columns}`
+      const customer = companies[project.companyIndex]?.name ?? ""
+      return `${index}=${project.name} (${project.startDate} bis ${project.endDate}); customer ${customer}; task type ${project.taskTypeIndex}=${type.displayName}; columns: ${columns}`
     })
     .join("\n")
   for (let offset = 0; offset < preset.tasks; offset += TASK_BATCH) {
@@ -521,12 +534,12 @@ Time is a clock time HH:mm between 00:00 and 23:59, not a duration.
 Durations, budgets and sizes are Number.
 Number values use a dot. Checkbox is true or false. Date is YYYY-MM-DD. ComboBox value is exactly one of its options. Text is a short realistic value.
 Assignees: ${employees.map((employee, index) => `${index}=${employee.firstName} ${employee.lastName}`).join("; ")}.
-Use only those indexes. Dates must fall inside the chosen project's start and end. Format YYYY-MM-DD.
+Use only those indexes. About one in five tasks is due on a weekday in the 21 days before ${today}. The other tasks are due today or later. Every date must fall inside the chosen project's start and end. Format YYYY-MM-DD.
 When the project lists named columns, statusName is exactly one of those names and statusCategory is that column's category.
 Spread a project's tasks across its columns, from the first stage to the last.
 When the columns say default, statusName is empty and statusCategory is Todo, InProgress or Done.
 priority is Highest, High, Medium, Low or Lowest.
-Subjects must be concrete work for that project's task type.
+Subjects must be concrete work for that project's task type and must name that project's customer company, for example "Steuererklärung für Haas & Partner".
 When a project has named columns, give it one task per column before adding further tasks of that same type.`,
         },
       ])
@@ -545,6 +558,7 @@ When a project has named columns, give it one task per column before adding furt
           projectIndex,
           taskTypeIndex: project.taskTypeIndex,
           assigneeIndex: clampIndex(task.assigneeIndex, employees.length),
+          assignToAdmin: false,
           statusCategory: status.category,
           statusName: status.name,
           priority: task.priority,
@@ -577,6 +591,8 @@ When a project has named columns, give it one task per column before adding furt
     tick("Aufgaben")
   }
   applyWorkflowQuotas(tasks, projects, taskTypes)
+  balanceTaskDates(tasks, projects, today)
+  assignAdminOwners(tasks)
   assignTaskFiles(tasks)
 
   let appointments: DemoPlan["appointments"] = []
@@ -600,7 +616,7 @@ Today is ${today}.
 Create exactly ${preset.appointments} appointments: kickoffs, milestone reviews, customer meetings or site visits that fit this industry.
 Projects: ${projectCatalog}.
 Attendees are zero-based employee indexes: ${employees.map((employee, index) => `${index}=${employee.firstName} ${employee.lastName}`).join("; ")}.
-startDate is a weekday within the next 21 days. startTime and endTime are HH:mm between 08:00 and 17:00. The meeting lasts 30 to 90 minutes.
+startDate is a weekday. About one in five appointments is in the last 21 days, the rest are within the next 21 days. startTime and endTime are HH:mm between 08:00 and 17:00. The meeting lasts 30 to 90 minutes.
 location is a realistic room, plant or customer site in ${languageName(request.language)}.`,
         },
       ]
@@ -622,6 +638,7 @@ location is a realistic room, plant or customer site in ${languageName(request.l
         ).map((attendee) => clampIndex(attendee, employees.length)),
       }
     })
+    balanceAppointmentDates(appointments, today)
     emit({
       type: "log",
       level: "success",

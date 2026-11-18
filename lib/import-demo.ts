@@ -1,4 +1,6 @@
-import { DEMO_PASSWORD, type DemoPlan } from "@/lib/demo-plan"
+import { fetchCompanyLogo } from "@/lib/company-logo"
+import { createAvatarDeck, type AvatarPicture } from "@/lib/contact-avatar"
+import { DEMO_PASSWORD, type DemoPlan, type PersonGender } from "@/lib/demo-plan"
 import { buildTaskDocument } from "@/lib/demo-files"
 import {
   attachTaskFile,
@@ -14,19 +16,119 @@ import {
   createTaskStatus,
   createTeam,
   errorText,
+  grantDataEntrySecurity,
   loadImportContext,
-  loadTaskInputFieldNames,
-  loadTypeEnums,
+  loadDynamicSchema,
+  loadSalutationOptions,
   matchEnumValue,
+  securityRulesForNewEntry,
+  shareCalendarWithUsers,
+  withReaderRoles,
   type DataFormInfo,
   type ImportContext,
+  type SecurityRuleInput,
 } from "@/lib/consolidate"
 import type { ConsolidateSession } from "@/lib/session"
+import { genderAdjective, genderLabel, inferPersonGender, matchSalutationId } from "@/lib/person-gender"
 import type { ImportSummary, StreamEvent } from "@/lib/stream-events"
 import { toGraphqlFieldValue, type TaskFieldDefinition } from "@/lib/task-fields"
 
 type CreatedType = { key: string; displayName: string; enumName: string | null }
 type CreatedPerson = { id: string; teamIndex: number }
+
+type PickedAvatar = AvatarPicture & { note: string }
+
+function assignAvatars(
+  people: { key: string; name: string; gender: PersonGender }[],
+  emit: (event: StreamEvent) => void
+): Map<string, PickedAvatar> {
+  const assigned = new Map<string, PickedAvatar>()
+  try {
+    const deck = createAvatarDeck()
+    for (const person of people) {
+      const picture = deck.take(person.gender)
+      if (picture) assigned.set(person.key, { ...picture, note: "" })
+    }
+    for (const person of people) {
+      if (assigned.has(person.key) || person.gender === "neutral") continue
+      const picture = deck.take("neutral")
+      if (!picture) break
+      assigned.set(person.key, {
+        ...picture,
+        note: ` Ersatzbild (neutral), weil kein weiteres ${genderAdjective(person.gender)} Bild frei war.`,
+      })
+    }
+  } catch (error) {
+    emit({
+      type: "log",
+      level: "error",
+      message: `Avatarbilder nicht geladen: ${errorText(error)}`,
+    })
+    return assigned
+  }
+  for (const person of people) {
+    if (assigned.has(person.key)) continue
+    emit({
+      type: "log",
+      level: "error",
+      message: `Kein weiteres Avatarbild für „${person.name}“ (${genderLabel(person.gender)}).`,
+    })
+  }
+  return assigned
+}
+
+function avatarSentence(avatar: PickedAvatar | undefined, hasAvatar: boolean): string {
+  if (!avatar) return ""
+  return hasAvatar ? ` Avatar gesetzt.${avatar.note}` : " Avatar nicht übernommen."
+}
+
+async function loadLogo(
+  name: string,
+  index: number,
+  emit: (event: StreamEvent) => void
+): Promise<Buffer | undefined> {
+  try {
+    return await fetchCompanyLogo(index)
+  } catch (error) {
+    emit({
+      type: "log",
+      level: "error",
+      message: `Firmenlogo für „${name}“ nicht geladen: ${errorText(error)}`,
+    })
+    return undefined
+  }
+}
+
+function findCollection(forms: DataFormInfo[], tokens: string[]): string | undefined {
+  const active = forms.filter((form) => !form.archived)
+  return (
+    active.find((form) => tokens.includes(form.dataCollection.toLowerCase())) ??
+    active.find((form) => tokens.includes(form.displayName.toLowerCase()))
+  )?.dataCollection
+}
+
+async function readerSecurity(
+  session: ConsolidateSession,
+  dataCollection: string | undefined,
+  adminUserId: string,
+  roleIds: string[],
+  emit: (event: StreamEvent) => void,
+  label: string
+): Promise<SecurityRuleInput[] | undefined> {
+  try {
+    const rules = dataCollection
+      ? await securityRulesForNewEntry(session, dataCollection, adminUserId)
+      : [{ key: { userId: adminUserId }, value: "Manage" }]
+    return withReaderRoles(rules, roleIds)
+  } catch (error) {
+    emit({
+      type: "log",
+      level: "error",
+      message: `${label}-Rechte konnten nicht gelesen werden. Die Datensätze werden mit Leserecht der Demo-Rollen angelegt: ${errorText(error)}`,
+    })
+    return withReaderRoles([{ key: { userId: adminUserId }, value: "Manage" }], roleIds)
+  }
+}
 
 function findForm(forms: DataFormInfo[], kind: "project" | "task"): DataFormInfo | undefined {
   const tokens =
@@ -128,63 +230,7 @@ export async function importDemoPlan(
     tick("Aufgaben-Typen")
   }
 
-  await resolveEnums(session, projectTypes, taskTypes, emit)
-  const taskInputFields = await waitForTaskFields(session, plan, emit)
-
-  const companyIds: string[] = []
-  for (const company of plan.companies) {
-    try {
-      const created = await createCompanyRecord(session, company)
-      companyIds.push(created.id)
-      summary.companies += 1
-      emit({
-        type: "log",
-        level: "success",
-        message: `Unternehmen „${created.displayName}“ angelegt (ID: ${created.id}).`,
-      })
-    } catch (error) {
-      companyIds.push("")
-      summary.failed += 1
-      emit({
-        type: "log",
-        level: "error",
-        message: `Unternehmen „${company.name}“ fehlgeschlagen: ${errorText(error)}`,
-      })
-    }
-    tick("Unternehmen")
-  }
-
-  for (const contact of plan.contacts) {
-    const companyId = companyIds[contact.companyIndex]
-    const companyName = plan.companies[contact.companyIndex]?.name
-    try {
-      const created = await createContact(session, {
-        firstName: contact.firstName,
-        lastName: contact.lastName,
-        email: contact.email,
-        position: contact.position,
-        phone: contact.phone,
-        department: contact.department,
-        companyId: companyId || undefined,
-      })
-      summary.contacts += 1
-      emit({
-        type: "log",
-        level: "success",
-        message: companyName
-          ? `Kontakt „${created.displayName}“ bei „${companyName}“ angelegt (ID: ${created.id}).`
-          : `Kontakt „${created.displayName}“ angelegt (ID: ${created.id}).`,
-      })
-    } catch (error) {
-      summary.failed += 1
-      emit({
-        type: "log",
-        level: "error",
-        message: `Kontakt „${contact.firstName} ${contact.lastName}“ fehlgeschlagen: ${errorText(error)}`,
-      })
-    }
-    tick("Kontakte")
-  }
+  const taskInputFields = await reloadCreatedSchema(session, plan, projectTypes, taskTypes, emit)
 
   const defaultRole =
     context.roles.find((role) => role.isDefault && !role.isSystemRole) ??
@@ -214,16 +260,194 @@ export async function importDemoPlan(
     tick("Teams")
   }
 
+  const readerRoleIds = Array.from(
+    new Set([defaultRole?.id, ...teamIds].filter((id): id is string => Boolean(id)))
+  )
+  if (readerRoleIds.length > 0) {
+    emit({
+      type: "log",
+      level: "info",
+      message:
+        "Demo-Benutzer erhalten über ihre Rolle und ihre Teams mindestens Leserecht auf alle angelegten Demodaten.",
+    })
+  }
+
+  const contactCollection = findCollection(context.dataForms, ["contact", "contacts", "kontakt", "kontakte"])
+  const companySecurity = await readerSecurity(
+    session,
+    findCollection(context.dataForms, ["company", "companies", "unternehmen", "firma"]),
+    context.me.user.id,
+    readerRoleIds,
+    emit,
+    "Unternehmen"
+  )
+  const contactSecurity = await readerSecurity(
+    session,
+    contactCollection,
+    context.me.user.id,
+    readerRoleIds,
+    emit,
+    "Kontakt"
+  )
+  const projectSecurity = await readerSecurity(
+    session,
+    projectForm.dataCollection,
+    context.me.user.id,
+    readerRoleIds,
+    emit,
+    "Projekt"
+  )
+  const taskSecurity = await readerSecurity(
+    session,
+    taskForm.dataCollection,
+    context.me.user.id,
+    readerRoleIds,
+    emit,
+    "Aufgaben"
+  )
+  const appointmentSecurity = await readerSecurity(
+    session,
+    findCollection(context.dataForms, ["appointment", "appointments", "termin", "termine"]),
+    context.me.user.id,
+    readerRoleIds,
+    emit,
+    "Termin"
+  )
+
+  const companyIds: string[] = []
+  const contactsByCompany = plan.companies.map(() => [] as { id: string; name: string }[])
+  for (const [companyIndex, company] of plan.companies.entries()) {
+    try {
+      const logo = await loadLogo(company.name, companyIndex, emit)
+      const created = await createCompanyRecord(session, { ...company, logo, securityRules: companySecurity })
+      companyIds.push(created.id)
+      summary.companies += 1
+      emit({
+        type: "log",
+        level: logo && !created.hasLogo ? "error" : "success",
+        message: `Unternehmen „${created.displayName}“ angelegt (ID: ${created.id}).${
+          logo ? (created.hasLogo ? " Logo gesetzt." : " Logo nicht übernommen.") : ""
+        }`,
+      })
+    } catch (error) {
+      companyIds.push("")
+      summary.failed += 1
+      emit({
+        type: "log",
+        level: "error",
+        message: `Unternehmen „${company.name}“ fehlgeschlagen: ${errorText(error)}`,
+      })
+    }
+    tick("Unternehmen")
+  }
+
+  let salutationOptions: { id: number; value: string }[] = []
+  if (contactCollection) {
+    try {
+      salutationOptions = await loadSalutationOptions(session, contactCollection)
+    } catch (error) {
+      emit({
+        type: "log",
+        level: "error",
+        message: `Anreden konnten nicht gelesen werden, Kontakte werden ohne Anrede angelegt: ${errorText(error)}`,
+      })
+    }
+  }
+  const salutationByGender = new Map<PersonGender, number>()
+  for (const gender of ["male", "female", "neutral"] as const) {
+    const id = matchSalutationId(salutationOptions, gender)
+    if (typeof id === "number") salutationByGender.set(gender, id)
+  }
+  const avatars = assignAvatars(
+    [
+      ...plan.contacts.map((contact, index) => ({
+        key: `contact:${index}`,
+        name: `${contact.firstName} ${contact.lastName}`,
+        gender: contact.gender ?? inferPersonGender(contact.firstName),
+      })),
+      ...plan.employees.map((employee, index) => ({
+        key: `employee:${index}`,
+        name: `${employee.firstName} ${employee.lastName}`,
+        gender: employee.gender ?? inferPersonGender(employee.firstName),
+      })),
+    ],
+    emit
+  )
+
+  for (const [index, contact] of plan.contacts.entries()) {
+    const companyId = companyIds[contact.companyIndex]
+    const companyName = plan.companies[contact.companyIndex]?.name
+    try {
+      const gender = contact.gender ?? inferPersonGender(contact.firstName)
+      const avatar = avatars.get(`contact:${index}`)
+      const created = await createContact(session, {
+        firstName: contact.firstName,
+        lastName: contact.lastName,
+        email: contact.email,
+        position: contact.position,
+        phone: contact.phone,
+        department: contact.department,
+        companyId: companyId || undefined,
+        avatar,
+        salutation: salutationByGender.get(gender),
+        securityRules: contactSecurity,
+      })
+      summary.contacts += 1
+      contactsByCompany[contact.companyIndex]?.push({
+        id: created.id,
+        name: created.displayName,
+      })
+      const linked = Boolean(companyId) && created.linkedCompany
+      const avatarMissing = Boolean(avatar) && !created.hasAvatar
+      emit({
+        type: "log",
+        level: (companyId && !created.linkedCompany) || avatarMissing ? "error" : "success",
+        message:
+          (linked
+            ? `Kontakt „${created.displayName}“ mit Unternehmen „${companyName}“ verknüpft (ID: ${created.id}).`
+            : companyName
+              ? `Kontakt „${created.displayName}“ angelegt (ID: ${created.id}), ohne Beziehung zu „${companyName}“.`
+              : `Kontakt „${created.displayName}“ angelegt (ID: ${created.id}).`) +
+          avatarSentence(avatar, created.hasAvatar),
+      })
+    } catch (error) {
+      summary.failed += 1
+      emit({
+        type: "log",
+        level: "error",
+        message: `Kontakt „${contact.firstName} ${contact.lastName}“ fehlgeschlagen: ${errorText(error)}`,
+      })
+    }
+    tick("Kontakte")
+  }
+
   const people: CreatedPerson[] = []
-  for (const employee of plan.employees) {
+  let licenseReached = false
+  for (const [index, employee] of plan.employees.entries()) {
     const teamId = teamIds[employee.teamIndex] || teamIds.find(Boolean) || ""
     const roleIds = [defaultRole?.id, teamId].filter((id): id is string => Boolean(id))
     try {
+      if (licenseReached) {
+        people.push({ id: "", teamIndex: employee.teamIndex })
+        tick("Mitarbeiter")
+        continue
+      }
       if (roleIds.length === 0) throw new Error("Keine Rolle für neue Mitarbeiter vorhanden.")
       let contactId: string | undefined
+      let avatarFailed = false
+      let avatarNote = ""
       try {
-        const contact = await createContact(session, employee)
+        const gender = employee.gender ?? inferPersonGender(employee.firstName)
+        const avatar = avatars.get(`employee:${index}`)
+        const contact = await createContact(session, {
+          ...employee,
+          avatar,
+          salutation: salutationByGender.get(gender),
+          securityRules: contactSecurity,
+        })
         contactId = contact.id
+        avatarFailed = Boolean(avatar) && !contact.hasAvatar
+        avatarNote = avatarSentence(avatar, contact.hasAvatar)
       } catch (error) {
         emit({
           type: "log",
@@ -236,22 +460,33 @@ export async function importDemoPlan(
         password: DEMO_PASSWORD,
         contactId,
         roleIds: Array.from(new Set(roleIds)),
+        adminUserId: context.me.user.id,
+        readerRoleIds,
       })
       people.push({ id: user.id, teamIndex: employee.teamIndex })
       summary.employees += 1
       emit({
         type: "log",
-        level: "success",
-        message: `Mitarbeiter „${employee.firstName} ${employee.lastName}“ angelegt (ID: ${user.id}).`,
+        level: avatarFailed ? "error" : "success",
+        message: `Mitarbeiter „${employee.firstName} ${employee.lastName}“ angelegt (ID: ${user.id}). Der verbundene Service-User hat Manage-Recht.${avatarNote}`,
       })
     } catch (error) {
       people.push({ id: "", teamIndex: employee.teamIndex })
       summary.failed += 1
+      const message = errorText(error)
       emit({
         type: "log",
         level: "error",
-        message: `Mitarbeiter „${employee.firstName} ${employee.lastName}“ fehlgeschlagen: ${errorText(error)}`,
+        message: `Mitarbeiter „${employee.firstName} ${employee.lastName}“ fehlgeschlagen: ${message}`,
       })
+      if (/license limit/i.test(message)) {
+        licenseReached = true
+        emit({
+          type: "log",
+          level: "error",
+          message: "Weitere Mitarbeiter werden übersprungen, weil das Lizenzlimit der Instanz erreicht ist.",
+        })
+      }
     }
     tick("Mitarbeiter")
   }
@@ -270,6 +505,7 @@ export async function importDemoPlan(
         projectManagerId: manager?.id || undefined,
         responsibleId: teamId || manager?.id || undefined,
         typeName: projectTypes[project.projectTypeIndex]?.enumName ?? undefined,
+        securityRules: projectSecurity,
       })
       projectIds.push(created.id)
       summary.projects += 1
@@ -310,11 +546,34 @@ export async function importDemoPlan(
     tick("Projekte")
   }
 
-  for (const task of plan.tasks) {
+  const serviceUser = context.me.user.type === "Service"
+  if (serviceUser && plan.tasks.some((task) => task.assignToAdmin)) {
+    emit({
+      type: "log",
+      level: "info",
+      message:
+        "Der Service-User kann nicht als Verantwortlicher gesetzt werden. Diese Aufgaben bleiben bei den Mitarbeitern.",
+    })
+  }
+  const fallbackStatus = statuses.find((status) => status.availableInTypes.length === 0) ?? statuses[0]
+
+  for (const [taskIndex, task] of plan.tasks.entries()) {
     const projectId = projectIds[task.projectIndex]
+    const project = plan.projects[task.projectIndex]
+    const companyId = project ? companyIds[project.companyIndex] : ""
+    const companyName = project ? plan.companies[project.companyIndex]?.name : ""
+    const companyContacts = project ? (contactsByCompany[project.companyIndex] ?? []) : []
+    const contact = companyContacts.length > 0 ? companyContacts[taskIndex % companyContacts.length] : undefined
     const assignee = people[task.assigneeIndex]
-    const typeKey = taskTypes[task.taskTypeIndex]?.key
-    const status = pickStatus(statuses, task, typeKey, columnsByType.get(task.taskTypeIndex))
+    const assigneeId = !serviceUser && task.assignToAdmin ? context.me.user.id : assignee?.id || undefined
+    const typeInfo = taskTypes[task.taskTypeIndex]
+    const typeReady = Boolean(typeInfo?.enumName)
+    const status = pickStatus(
+      statuses,
+      task,
+      typeReady ? typeInfo?.key : undefined,
+      typeReady ? columnsByType.get(task.taskTypeIndex) : undefined
+    )
     try {
       if (!status) throw new Error("Kein Aufgabenstatus vorhanden.")
       const created = await createTaskRecord(session, {
@@ -323,11 +582,13 @@ export async function importDemoPlan(
         statusId: status.id,
         priority: task.priority,
         projectId: projectId || undefined,
-        responsibleId: assignee?.id || undefined,
+        responsibleId: assigneeId,
         startDate: task.startDate,
         dueDate: task.dueDate,
-        typeName: taskTypes[task.taskTypeIndex]?.enumName ?? undefined,
+        fallbackStatusId: fallbackStatus?.id,
+        typeName: typeReady ? typeInfo?.enumName ?? undefined : undefined,
         extraFields: taskFieldValues(plan, task, taskInputFields),
+        securityRules: taskSecurity,
       })
       summary.tasks += 1
       const fieldNote = created.fieldsApplied
@@ -339,9 +600,54 @@ export async function importDemoPlan(
         type: "log",
         level: created.linkedType && (created.fieldsApplied || task.fieldValues.length === 0) ? "success" : "error",
         message: created.linkedType
-          ? `Aufgabe „${created.displayName}“ im Status „${status.name}“ angelegt (ID: ${created.id}).${fieldNote}`
-          : `Aufgabe „${created.displayName}“ im Status „${status.name}“ angelegt (ID: ${created.id}), ohne Aufgaben-Typ.${fieldNote}`,
+          ? `Aufgabe „${created.displayName}“ im Status „${status.name}“ angelegt (ID: ${created.id}).${fieldNote}${task.assignToAdmin && !serviceUser ? " Verantwortlich ist der verbundene Service-User." : ""}`
+          : `Aufgabe „${created.displayName}“ im Status „${status.name}“ angelegt (ID: ${created.id}), ohne Aufgaben-Typ.${fieldNote}${task.assignToAdmin && !serviceUser ? " Verantwortlich ist der verbundene Service-User." : ""}`,
       })
+      let taskVector = created.changeVector ?? undefined
+      if (companyId) {
+        try {
+          taskVector = (await associateRecords(session, created.id, companyId, taskVector)) ?? taskVector
+          emit({
+            type: "log",
+            level: "success",
+            message: `Aufgabe „${created.displayName}“ mit Unternehmen „${companyName}“ verknüpft.`,
+          })
+        } catch (error) {
+          emit({
+            type: "log",
+            level: "error",
+            message: `Verknüpfung von „${created.displayName}“ mit Unternehmen „${companyName}“ fehlgeschlagen: ${errorText(error)}`,
+          })
+        }
+      } else if (companyName) {
+        emit({
+          type: "log",
+          level: "error",
+          message: `Aufgabe „${created.displayName}“ konnte nicht mit „${companyName}“ verknüpft werden, weil das Unternehmen nicht angelegt wurde.`,
+        })
+      }
+      if (contact) {
+        try {
+          taskVector = (await associateRecords(session, created.id, contact.id, taskVector)) ?? taskVector
+          emit({
+            type: "log",
+            level: "success",
+            message: `Aufgabe „${created.displayName}“ mit Ansprechperson „${contact.name}“ verknüpft.`,
+          })
+        } catch (error) {
+          emit({
+            type: "log",
+            level: "error",
+            message: `Verknüpfung von „${created.displayName}“ mit Ansprechperson „${contact.name}“ fehlgeschlagen: ${errorText(error)}`,
+          })
+        }
+      } else if (companyName) {
+        emit({
+          type: "log",
+          level: "error",
+          message: `Aufgabe „${created.displayName}“ hat keine Ansprechperson bei „${companyName}“.`,
+        })
+      }
       if (task.file) {
         try {
           const versions = Array.from({ length: task.file.versions }, (_, index) =>
@@ -356,7 +662,7 @@ export async function importDemoPlan(
           )
           const attached = await attachTaskFile(session, {
             taskId: created.id,
-            changeVector: created.changeVector,
+            changeVector: taskVector,
             fileName: task.file.name,
             contentType: versions[0].contentType,
             versions: versions.map((version) => version.body),
@@ -389,6 +695,31 @@ export async function importDemoPlan(
   }
 
   const calendarId = await resolveCalendar(session, context, plan.language, emit)
+  if (calendarId) {
+    const userIds = people.map((person) => person.id).filter((id) => Boolean(id))
+    try {
+      const share = await shareCalendarWithUsers(session, calendarId, userIds)
+      if (share.failed > 0) {
+        emit({
+          type: "log",
+          level: "error",
+          message: `Kalenderfreigabe für ${share.failed} Demo-Benutzer fehlgeschlagen${share.message ? `: ${share.message}` : "."}`,
+        })
+      } else if (userIds.length > 0) {
+        emit({
+          type: "log",
+          level: "success",
+          message: "Demo-Benutzer können die Termine im Kalender lesen.",
+        })
+      }
+    } catch (error) {
+      emit({
+        type: "log",
+        level: "error",
+        message: `Kalenderfreigabe fehlgeschlagen: ${errorText(error)}`,
+      })
+    }
+  }
   for (const appointment of plan.appointments) {
     const projectId = projectIds[appointment.projectIndex]
     const projectName = plan.projects[appointment.projectIndex]?.name
@@ -418,6 +749,17 @@ export async function importDemoPlan(
         level: "success",
         message: `Termin „${created.title}“ angelegt (ID: ${created.id}).`,
       })
+      if (created.appointmentId && appointmentSecurity) {
+        try {
+          await grantDataEntrySecurity(session, created.appointmentId, appointmentSecurity)
+        } catch (error) {
+          emit({
+            type: "log",
+            level: "error",
+            message: `Leserecht für „${created.title}“ fehlgeschlagen: ${errorText(error)}`,
+          })
+        }
+      }
       if (created.appointmentId && projectId) {
         try {
           await associateRecords(session, created.appointmentId, projectId)
@@ -520,34 +862,64 @@ async function ensureType(
   }
 }
 
-async function waitForTaskFields(
+async function reloadCreatedSchema(
   session: ConsolidateSession,
   plan: DemoPlan,
+  projectTypes: CreatedType[],
+  taskTypes: CreatedType[],
   emit: (event: StreamEvent) => void
 ): Promise<Set<string>> {
-  const expected = plan.taskTypes.flatMap((type) => type.fields.map((field) => field.key))
+  const created = [...projectTypes, ...taskTypes].filter((type) => type.key)
+  const expectedFields = plan.taskTypes.flatMap((type, index) =>
+    taskTypes[index]?.key ? type.fields.map((field) => field.key) : []
+  )
+  if (created.length === 0 && expectedFields.length === 0) return new Set()
+
+  emit({ type: "log", level: "info", message: "Schema wird neu geladen." })
   let available = new Set<string>()
-  if (expected.length === 0) return available
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    available = await loadTaskInputFieldNames(session)
-    if (expected.every((key) => available.has(key))) {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const schema = await loadDynamicSchema(session)
+    available = schema.taskInputFields
+    let pendingTypes = 0
+    for (const type of projectTypes) {
+      if (!type.key) continue
+      const matched = matchEnumValue(schema.projectTypes, type.key, type.displayName)
+      if (matched) type.enumName = matched
+      else if (!type.enumName) pendingTypes += 1
+    }
+    for (const type of taskTypes) {
+      if (!type.key) continue
+      const matched = matchEnumValue(schema.taskTypes, type.key, type.displayName)
+      if (matched) type.enumName = matched
+      else if (!type.enumName) pendingTypes += 1
+    }
+    const pendingFields = expectedFields.filter((key) => !available.has(key))
+    if (pendingTypes === 0 && pendingFields.length === 0) {
       emit({
         type: "log",
         level: "success",
-        message: "Zusatzfelder der Aufgaben-Typen sind im Schema verfügbar.",
+        message: "Schema neu geladen. Neue Typen und Zusatzfelder sind sichtbar.",
       })
       return available
     }
-    await new Promise((resolve) => setTimeout(resolve, 800))
+    await new Promise((resolve) => setTimeout(resolve, 1500))
   }
-  const missing = plan.taskTypes
-    .flatMap((type) => type.fields)
+
+  const missingTypes = [...projectTypes, ...taskTypes]
+    .filter((type) => type.key && !type.enumName)
+    .map((type) => type.displayName)
+  const missingFields = plan.taskTypes
+    .flatMap((type, index) => (taskTypes[index]?.key ? type.fields : []))
     .filter((field) => !available.has(field.key))
     .map((field) => field.label)
+  const parts = [
+    missingTypes.length > 0 ? `Typen noch nicht im Schema: ${missingTypes.join(", ")}.` : "",
+    missingFields.length > 0 ? `Zusatzfelder noch nicht im Schema: ${missingFields.join(", ")}.` : "",
+  ].filter(Boolean)
   emit({
     type: "log",
     level: "error",
-    message: `Einige Zusatzfelder sind im Schema noch nicht sichtbar: ${missing.join(", ")}.`,
+    message: `Schema neu geladen, aber noch unvollständig. ${parts.join(" ")} Zugehörige Datensätze werden ohne diese Angaben angelegt.`,
   })
   return available
 }
@@ -566,38 +938,6 @@ function taskFieldValues(
     if (value !== undefined) values[field.key] = value
   }
   return values
-}
-
-async function resolveEnums(
-  session: ConsolidateSession,
-  projectTypes: CreatedType[],
-  taskTypes: CreatedType[],
-  emit: (event: StreamEvent) => void
-): Promise<void> {
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const enums = await loadTypeEnums(session)
-    let pending = 0
-    for (const type of projectTypes) {
-      if (!type.key || type.enumName) continue
-      type.enumName = matchEnumValue(enums.projectTypes, type.key, type.displayName)
-      if (!type.enumName) pending += 1
-    }
-    for (const type of taskTypes) {
-      if (!type.key || type.enumName) continue
-      type.enumName = matchEnumValue(enums.taskTypes, type.key, type.displayName)
-      if (!type.enumName) pending += 1
-    }
-    if (pending === 0) {
-      emit({ type: "log", level: "success", message: "Neue Typen sind im GraphQL-Schema verfügbar." })
-      return
-    }
-    await new Promise((resolve) => setTimeout(resolve, 800))
-  }
-  emit({
-    type: "log",
-    level: "error",
-    message: "Einige neue Typen sind im Schema noch nicht als Enum sichtbar. Zugehörige Datensätze werden ohne Typ angelegt.",
-  })
 }
 
 async function ensureStatuses(

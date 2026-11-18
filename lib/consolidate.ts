@@ -59,7 +59,8 @@ export async function graphqlRequest<T>(
   instanceUrl: string,
   cookieHeader: string,
   query: string,
-  variables?: Record<string, unknown>
+  variables?: Record<string, unknown>,
+  headers?: Record<string, string>
 ): Promise<GraphqlResult<T>> {
   let response: Response
   try {
@@ -68,7 +69,10 @@ export async function graphqlRequest<T>(
       headers: {
         "content-type": "application/json",
         accept: "application/json",
+        "accept-language": "de",
+        "x-time-zone": "Europe/Berlin",
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        ...headers,
       },
       body: JSON.stringify({ query, variables }),
       cache: "no-store",
@@ -85,7 +89,8 @@ export async function graphqlUpload<T>(
   cookieHeader: string,
   query: string,
   variables: Record<string, unknown>,
-  files: { path: string; filename: string; contentType: string; body: Buffer }[]
+  files: { path: string; filename: string; contentType: string; body: Buffer }[],
+  headers?: Record<string, string>
 ): Promise<GraphqlResult<T>> {
   const map: Record<string, string[]> = {}
   const form = new FormData()
@@ -107,7 +112,10 @@ export async function graphqlUpload<T>(
       method: "POST",
       headers: {
         accept: "application/json",
+        "accept-language": "de",
+        "x-time-zone": "Europe/Berlin",
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        ...headers,
       },
       body: form,
       cache: "no-store",
@@ -147,13 +155,15 @@ async function readGraphqlResponse<T>(
 export async function sessionGraphql<T>(
   session: ConsolidateSession,
   query: string,
-  variables?: Record<string, unknown>
+  variables?: Record<string, unknown>,
+  headers?: Record<string, string>
 ): Promise<GraphqlResult<T>> {
   const result = await graphqlRequest<T>(
     session.instanceUrl,
     session.cookieHeader,
     query,
-    variables
+    variables,
+    { ...apiKeyHeader(session), ...headers }
   )
   if (result.cookieHeader !== session.cookieHeader) {
     session.cookieHeader = result.cookieHeader
@@ -173,7 +183,8 @@ async function sessionGraphqlUpload<T>(
     session.cookieHeader,
     query,
     variables,
-    files
+    files,
+    apiKeyHeader(session)
   )
   if (result.cookieHeader !== session.cookieHeader) {
     session.cookieHeader = result.cookieHeader
@@ -182,17 +193,11 @@ async function sessionGraphqlUpload<T>(
   return result
 }
 
-export type SignInResult = {
-  succeeded: boolean
-  requiresTwoFactor: boolean
-  isLockedOut: boolean
-  requiresPasswordChange: boolean
-}
-
 export type MeUser = {
   id: string
   email: string
   displayName: string
+  type?: "Employee" | "Service" | "Restricted"
 }
 
 export type MePayload = {
@@ -204,19 +209,6 @@ export type MePayload = {
   }
   user: MeUser
 }
-
-const AUTHENTICATE = `
-  mutation Authenticate($input: AuthenticateInput!) {
-    authenticate(input: $input) {
-      signInResult {
-        succeeded
-        requiresTwoFactor
-        isLockedOut
-        requiresPasswordChange
-      }
-    }
-  }
-`
 
 const ME = `
   query Me {
@@ -235,64 +227,50 @@ const ME = `
   }
 `
 
+function apiKeyHeader(session: ConsolidateSession): Record<string, string> {
+  return { "X-API-Key": session.apiKey }
+}
+
 export async function authenticate(
   instanceUrl: string,
-  username: string,
-  password: string
-): Promise<{ signIn: SignInResult; cookieHeader: string; me: MePayload }> {
-  const auth = await graphqlRequest<{
-    authenticate: { signInResult: SignInResult | null }
-  }>(instanceUrl, "", AUTHENTICATE, { input: { username, password } })
-
-  const signIn = auth.data?.authenticate?.signInResult
-  const authMessage = collectMessages(auth.errors)
-  if (!signIn) {
-    throw new Error(authMessage || "Die Anmeldung hat kein Ergebnis geliefert.")
+  apiKey: string
+): Promise<{ cookieHeader: string; me: MePayload }> {
+  const key = apiKey.trim()
+  let meResult: GraphqlResult<{ me: MePayload }>
+  try {
+    meResult = await graphqlRequest<{ me: MePayload }>(instanceUrl, "", ME, undefined, {
+      "X-API-Key": key,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : ""
+    if (/\b401\b|\b403\b/.test(message)) {
+      throw new Error("Der API-Schlüssel wurde abgelehnt. Schlüssel und Instanz-URL prüfen.")
+    }
+    throw error
   }
-  if (signIn.requiresTwoFactor) {
-    throw new Error("Zwei-Faktor-Anmeldung wird von diesem Generator nicht unterstützt.")
+  const authMessage = collectMessages(meResult.errors)
+  if (/not authorized|unauthenticated|api key/i.test(authMessage)) {
+    throw new Error("Der API-Schlüssel wurde abgelehnt. Schlüssel und Instanz-URL prüfen.")
   }
-  if (signIn.isLockedOut) {
-    throw new Error("Das Konto ist gesperrt.")
-  }
-  if (signIn.requiresPasswordChange) {
-    throw new Error("Das Passwort muss zuerst in Consolidate geändert werden.")
-  }
-  if (!signIn.succeeded) {
-    throw new Error(authMessage || "Anmeldung fehlgeschlagen. Benutzername oder Passwort prüfen.")
-  }
-  if (!auth.cookieHeader) {
-    throw new Error("Die Instanz hat kein Sitzungs-Cookie gesetzt.")
-  }
-
-  const meResult = await graphqlRequest<{ me: MePayload }>(
-    instanceUrl,
-    auth.cookieHeader,
-    ME
-  )
   const me = meResult.data?.me
   if (!me?.user) {
-    throw new Error(
-      collectMessages(meResult.errors) ||
-        "Die Sitzung wurde nicht erkannt. Die Instanz hat die Anmeldung nicht bestätigt."
-    )
+    throw new Error(authMessage || "Der API-Schlüssel wurde abgelehnt. Schlüssel und Instanz-URL prüfen.")
   }
   if (!me.permissions.editUsers || !me.permissions.dataForms) {
     throw new Error(
-      "Dieses Konto darf keine Benutzer oder Formulartypen anlegen. Bitte mit einem Administrator anmelden."
+      "Der Service-User dieses Schlüssels darf keine Benutzer oder Formulartypen anlegen."
     )
   }
 
   return {
-    signIn,
-    cookieHeader: meResult.cookieHeader || auth.cookieHeader,
+    cookieHeader: meResult.cookieHeader,
     me,
   }
 }
 
 export function buildSession(input: {
   instanceUrl: string
-  username: string
+  apiKey: string
   cookieHeader: string
   me: MePayload
 }): ConsolidateSession {
@@ -301,10 +279,11 @@ export function buildSession(input: {
     connected: true,
     instanceUrl: input.instanceUrl,
     appUrl: instanceAppUrl(input.instanceUrl),
-    username: input.username,
+    username: input.me.user.email || input.me.user.displayName,
     displayName: input.me.user.displayName,
     email: input.me.user.email,
     isAdmin: input.me.permissions.editUsers && input.me.permissions.dataForms,
+    apiKey: input.apiKey.trim(),
     cookieHeader: input.cookieHeader,
   }
 }
@@ -346,7 +325,7 @@ const IMPORT_CONTEXT = `
         databaseAdministration
         calendarAccess
       }
-      user { id email displayName }
+      user { id email displayName type }
     }
     roles { id name isDefault isSystemRole }
     taskStatuses { id name category availableInTypes }
@@ -390,10 +369,32 @@ const DATA_TYPE_COLORS = [
   "Rose",
 ] as const
 
+const createDataTypeArgNames = new Map<string, Set<string>>()
+
+async function createDataTypeArguments(session: ConsolidateSession): Promise<Set<string>> {
+  const cached = createDataTypeArgNames.get(session.instanceUrl)
+  if (cached) return cached
+  const result = await sessionGraphql<{
+    __type: { fields: { name: string; args: { name: string }[] }[] } | null
+  }>(session, `query CreateDataTypeArguments { __type(name: "Mutation") { fields { name args { name } } } }`)
+  const names = new Set(
+    result.data?.__type?.fields.find((field) => field.name === "createDataType")?.args.map((arg) => arg.name) ??
+      []
+  )
+  createDataTypeArgNames.set(session.instanceUrl, names)
+  return names
+}
+
+const PRIME_DATA_FORM = `
+  query PrimeDataForm($dataCollection: DataCollection!) {
+    dataForm(dataCollection: $dataCollection) { id dataCollection }
+  }
+`
+
 const CREATE_DATA_TYPE = `
   mutation CreateDataType($input: CreateDataTypeInput!) {
     createDataType(input: $input) {
-      dataType { key displayName }
+      dataType { key }
       errors { ... on Error { message } }
     }
   }
@@ -408,24 +409,47 @@ export async function createDataType(
     fields?: TaskFieldDefinition[]
   }
 ): Promise<{ key: string; displayName: string }> {
-  const result = await sessionGraphql<{
-    createDataType: {
-      dataType: { key: string; displayName: string } | null
-      errors: PayloadError[] | null
-    }
-  }>(session, CREATE_DATA_TYPE, {
+  const primed = await sessionGraphql<{
+    dataForm: { id: string; dataCollection: string } | null
+  }>(session, PRIME_DATA_FORM, { dataCollection: input.dataCollection })
+  const dataCollection = primed.data?.dataForm?.dataCollection || input.dataCollection
+  if (!primed.data?.dataForm) {
+    throw new Error(
+      collectMessages(primed.errors) || `Formular „${input.dataCollection}“ wurde nicht gefunden.`
+    )
+  }
+
+  const mutationArguments = await createDataTypeArguments(session)
+  const variables: Record<string, unknown> = {
     input: {
-      dataCollection: input.dataCollection,
+      dataCollection,
       displayName: input.displayName,
       color: DATA_TYPE_COLORS[input.colorIndex % DATA_TYPE_COLORS.length],
       level: "Task",
       additionalFields: (input.fields ?? []).map(toAdditionalField),
     },
-  })
+  }
+  const passesCollection = mutationArguments.has("dataCollection")
+  if (passesCollection) variables.dataCollection = dataCollection
+  const mutation = passesCollection
+    ? `mutation CreateDataType($input: CreateDataTypeInput!, $dataCollection: DataCollection!) {
+        createDataType(input: $input, dataCollection: $dataCollection) {
+          dataType { key }
+          errors { ... on Error { message } }
+        }
+      }`
+    : CREATE_DATA_TYPE
+
+  const result = await sessionGraphql<{
+    createDataType: {
+      dataType: { key: string } | null
+      errors: PayloadError[] | null
+    }
+  }>(session, mutation, variables)
   const payload = result.data?.createDataType
   const message = collectMessages(result.errors, payload?.errors)
   if (!payload?.dataType) throw new Error(message || "Datentyp wurde nicht angelegt.")
-  return payload.dataType
+  return { key: payload.dataType.key, displayName: input.displayName }
 }
 
 function toAdditionalField(field: TaskFieldDefinition) {
@@ -442,6 +466,8 @@ function toAdditionalField(field: TaskFieldDefinition) {
         field.valueType === "ComboBox",
       archived: false,
       validators: [],
+      allowedValues: [],
+      security: [],
       requiresManagePermissions: false,
       section: "Main",
       size: "Half",
@@ -449,6 +475,40 @@ function toAdditionalField(field: TaskFieldDefinition) {
       ...(field.valueType === "Number" ? { maxDecimals: 1 } : {}),
       ...(field.valueType === "ComboBox" ? { comboBoxOptions: field.options } : {}),
     },
+  }
+}
+
+const DYNAMIC_SCHEMA = `
+  query ReloadSchema {
+    projectTypes: __type(name: "ProjectTypes") {
+      enumValues { name description }
+    }
+    taskTypes: __type(name: "TaskTypes") {
+      enumValues { name description }
+    }
+    taskInput: __type(name: "TaskInput") {
+      inputFields { name }
+    }
+  }
+`
+
+export async function loadDynamicSchema(session: ConsolidateSession): Promise<{
+  projectTypes: EnumValue[]
+  taskTypes: EnumValue[]
+  taskInputFields: Set<string>
+}> {
+  const result = await sessionGraphql<{
+    projectTypes: { enumValues: EnumValue[] } | null
+    taskTypes: { enumValues: EnumValue[] } | null
+    taskInput: { inputFields: { name: string }[] } | null
+  }>(session, DYNAMIC_SCHEMA, undefined, {
+    "cache-control": "no-cache",
+    pragma: "no-cache",
+  })
+  return {
+    projectTypes: result.data?.projectTypes?.enumValues ?? [],
+    taskTypes: result.data?.taskTypes?.enumValues ?? [],
+    taskInputFields: new Set(result.data?.taskInput?.inputFields.map((field) => field.name) ?? []),
   }
 }
 
@@ -580,8 +640,10 @@ export async function createCompanyRecord(
     city: string
     country: string
     note: string
+    logo?: Buffer
+    securityRules?: SecurityRuleInput[]
   }
-): Promise<{ id: string; displayName: string }> {
+): Promise<{ id: string; displayName: string; hasLogo: boolean }> {
   const address = {
     ...(company.street ? { street: company.street } : {}),
     ...(company.zipCode ? { zipCode: company.zipCode } : {}),
@@ -600,16 +662,82 @@ export async function createCompanyRecord(
     email: [company.email],
     ...(company.phone ? { phoneNumber: [company.phone] } : {}),
   }
+  const variants: Record<string, unknown>[] = company.logo
+    ? [
+        { ...withAddress, logo: { file: null } },
+        { ...nameOnly, logo: { file: null } },
+        withAddress,
+        nameOnly,
+      ]
+    : [withAddress, nameOnly]
+
   let lastMessage = "Unternehmen wurde nicht angelegt."
-  for (const dataEntry of [withAddress, nameOnly]) {
-    const result = await sessionGraphql<{
-      createCompany: { company: { id: string; displayName: string } | null }
-    }>(session, CREATE_COMPANY, { input: { dataEntry } })
-    const created = result.data?.createCompany?.company
-    if (created) return created
-    lastMessage = collectMessages(result.errors) || lastMessage
+  let securityRules = company.securityRules
+  for (const dataEntry of variants) {
+    const post = (rules: SecurityRuleInput[] | undefined) => {
+      const input = { dataEntry, ...(rules ? { securityRules: rules } : {}) }
+      return dataEntry.logo && company.logo
+        ? sessionGraphqlUpload<{
+            createCompany: { company: { id: string; displayName: string } | null }
+          }>(session, CREATE_COMPANY, { input }, [
+            {
+              path: "variables.input.dataEntry.logo.file",
+              filename: "logo.png",
+              contentType: "image/png",
+              body: company.logo,
+            },
+          ])
+        : sessionGraphql<{
+            createCompany: { company: { id: string; displayName: string } | null }
+          }>(session, CREATE_COMPANY, { input })
+    }
+    try {
+      let result = await post(securityRules)
+      let created = result.data?.createCompany?.company
+      lastMessage = created ? lastMessage : collectMessages(result.errors) || lastMessage
+      if (!created && securityRules && /securityRules/i.test(lastMessage)) {
+        securityRules = undefined
+        result = await post(undefined)
+        created = result.data?.createCompany?.company
+        lastMessage = created ? lastMessage : collectMessages(result.errors) || lastMessage
+      }
+      if (created) return { ...created, hasLogo: Boolean(dataEntry.logo) }
+    } catch (error) {
+      lastMessage = errorText(error)
+      if (securityRules && /securityRules/i.test(lastMessage)) securityRules = undefined
+    }
   }
   throw new Error(lastMessage)
+}
+
+const CONTACT_SALUTATIONS = `
+  query ContactSalutations($dataCollection: DataCollection!) {
+    dataForm(dataCollection: $dataCollection) {
+      fields {
+        key
+        ... on ValueFieldDefinition {
+          comboBoxOptions { id value }
+        }
+      }
+    }
+  }
+`
+
+export async function loadSalutationOptions(
+  session: ConsolidateSession,
+  dataCollection: string | undefined
+): Promise<{ id: number; value: string }[]> {
+  if (!dataCollection) return []
+  const result = await sessionGraphql<{
+    dataForm: {
+      fields: { key: string; comboBoxOptions?: { id: number; value: string }[] | null }[]
+    } | null
+  }>(session, CONTACT_SALUTATIONS, { dataCollection })
+  if (result.errors?.length && !result.data?.dataForm) {
+    throw new Error(collectMessages(result.errors))
+  }
+  const field = result.data?.dataForm?.fields.find((item) => item.key === "salutation")
+  return field?.comboBoxOptions ?? []
 }
 
 const CREATE_CONTACT = `
@@ -630,67 +758,360 @@ export async function createContact(
     phone?: string
     department?: string
     companyId?: string
+    avatar?: { filename: string; contentType: string; body: Buffer }
+    salutation?: number
+    securityRules?: { key: { userId?: string; roleId?: string; groupId?: string }; value: string }[]
   }
-): Promise<{ id: string; displayName: string }> {
-  const affiliation = person.companyId
-    ? [
-        {
-          companyId: person.companyId,
-          ...(person.position ? { position: person.position } : {}),
-          ...(person.department ? { department: person.department } : {}),
-          includeInCrossReferences: true,
-        },
-      ]
-    : undefined
-  const attempts = [
-    {
-      firstName: person.firstName,
-      lastName: person.lastName,
-      email: [person.email],
-      ...(person.position ? { position: person.position } : {}),
-      ...(person.phone ? { phoneNumber: [person.phone] } : {}),
-      ...(affiliation ? { company: affiliation } : {}),
-    },
-    {
-      firstName: person.firstName,
-      lastName: person.lastName,
-      email: [person.email],
-      ...(person.position ? { position: person.position } : {}),
-      ...(affiliation ? { company: affiliation } : {}),
-    },
-    {
-      firstName: person.firstName,
-      lastName: person.lastName,
-      email: [person.email],
-      ...(person.position ? { position: person.position } : {}),
-    },
-    {
-      firstName: person.firstName,
-      lastName: person.lastName,
-      email: [person.email],
-    },
-  ]
+): Promise<{ id: string; displayName: string; linkedCompany: boolean; hasAvatar: boolean }> {
+  const dataEntry: Record<string, unknown> = {
+    firstName: person.firstName,
+    lastName: person.lastName,
+    email: [person.email],
+  }
+  if (person.phone) dataEntry.phoneNumber = [person.phone]
+  if (person.companyId) {
+    dataEntry.company = [
+      {
+        companyId: person.companyId,
+        ...(person.position ? { position: person.position } : {}),
+        ...(person.department ? { department: person.department } : {}),
+        includeInCrossReferences: true,
+      },
+    ]
+  }
+  if (typeof person.salutation === "number") dataEntry.salutation = person.salutation
+  if (person.avatar) dataEntry.avatar = { file: null }
 
   let lastMessage = "Kontakt wurde nicht angelegt."
-  for (const dataEntry of attempts) {
-    const result = await sessionGraphql<{
-      createContact: { contact: { id: string; displayName: string } | null }
-    }>(session, CREATE_CONTACT, { input: { dataEntry } })
+  let avatarAttempted = Boolean(person.avatar)
+  let securityRules = person.securityRules
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    let result: Awaited<ReturnType<typeof postContact>>
+    try {
+      result = await postContact(session, dataEntry, person.avatar, securityRules)
+    } catch (error) {
+      if (!dataEntry.avatar) throw error
+      delete dataEntry.avatar
+      avatarAttempted = false
+      lastMessage = errorText(error)
+      continue
+    }
     const contact = result.data?.createContact?.contact
-    if (contact) return contact
+    if (contact) {
+      return {
+        ...contact,
+        linkedCompany: Boolean(dataEntry.company),
+        hasAvatar: Boolean(dataEntry.avatar),
+      }
+    }
     lastMessage = collectMessages(result.errors) || lastMessage
+    const missing = missingInputField(lastMessage)
+    if (missing && Object.prototype.hasOwnProperty.call(dataEntry, missing)) {
+      delete dataEntry[missing]
+      continue
+    }
+    if (securityRules && /securityRules/i.test(lastMessage)) {
+      securityRules = undefined
+      continue
+    }
+    if (dataEntry.phoneNumber && /phone/i.test(lastMessage)) {
+      delete dataEntry.phoneNumber
+      continue
+    }
+    if (typeof dataEntry.salutation === "number" && /salutation|anrede/i.test(lastMessage)) {
+      delete dataEntry.salutation
+      continue
+    }
+    if (dataEntry.avatar && avatarAttempted) {
+      delete dataEntry.avatar
+      avatarAttempted = false
+      continue
+    }
+    break
   }
   throw new Error(lastMessage)
 }
 
+function postContact(
+  session: ConsolidateSession,
+  dataEntry: Record<string, unknown>,
+  avatar: { filename: string; contentType: string; body: Buffer } | undefined,
+  securityRules: { key: { userId?: string; roleId?: string; groupId?: string }; value: string }[] | undefined
+) {
+  const input: Record<string, unknown> = { dataEntry }
+  if (securityRules) input.securityRules = securityRules
+  const variables = { input }
+  if (dataEntry.avatar && avatar) {
+    return sessionGraphqlUpload<{
+      createContact: { contact: { id: string; displayName: string } | null }
+    }>(session, CREATE_CONTACT, variables, [
+      {
+        path: "variables.input.dataEntry.avatar.file",
+        filename: avatar.filename,
+        contentType: avatar.contentType,
+        body: avatar.body,
+      },
+    ])
+  }
+  return sessionGraphql<{
+    createContact: { contact: { id: string; displayName: string } | null }
+  }>(session, CREATE_CONTACT, variables)
+}
+
+const SECURITY_TEMPLATE_FIELDS = `
+  value
+  key {
+    __typename
+    ... on User { id }
+    ... on BasicRole { id }
+    ... on Team { id }
+    ... on SecurityGroup { id }
+  }
+`
+
 const CREATE_USER = `
   mutation CreateUser($input: CreateUserInput!) {
     createUser(input: $input) {
-      user { id email displayName firstName lastName }
+      user {
+        id
+        email
+        displayName
+        firstName
+        lastName
+        securityTemplate { ${SECURITY_TEMPLATE_FIELDS} }
+      }
       errors { ... on Error { message } }
     }
   }
 `
+
+const EDIT_SECURITY_TEMPLATE = `
+  mutation EditSecurityTemplate($input: EditSecurityTemplateInput!) {
+    editSecurityTemplate(input: $input) {
+      iSecurityTemplateProvider {
+        securityTemplate { ${SECURITY_TEMPLATE_FIELDS} }
+      }
+    }
+  }
+`
+
+type SecurityKey = {
+  __typename?: string | null
+  id?: string | null
+}
+
+type SecurityRule = {
+  value: string
+  key: SecurityKey | null
+}
+
+function principalInput(key: SecurityKey | null): { userId?: string; roleId?: string; groupId?: string } {
+  if (!key?.id || !key.__typename) {
+    throw new Error("Eine bestehende Sicherheitsregel des Benutzers konnte nicht gelesen werden.")
+  }
+  if (key.__typename === "User") return { userId: key.id }
+  if (key.__typename === "SecurityGroup") return { groupId: key.id }
+  if (key.__typename === "BasicRole" || key.__typename === "Team") return { roleId: key.id }
+  throw new Error(`Unbekannter Sicherheitsprinzipal ${key.__typename}.`)
+}
+
+function withAdminManage(rules: SecurityRule[] | null, adminUserId: string) {
+  const template = (rules ?? []).map((rule) => ({
+    key: principalInput(rule.key),
+    value: rule.value,
+  }))
+  const existing = template.find((rule) => rule.key.userId === adminUserId)
+  if (existing) existing.value = "Manage"
+  else template.push({ key: { userId: adminUserId }, value: "Manage" })
+  return template
+}
+
+function adminHasManage(rules: SecurityRule[] | null | undefined, adminUserId: string): boolean {
+  return (rules ?? []).some(
+    (rule) => rule.key?.__typename === "User" && rule.key.id === adminUserId && rule.value === "Manage"
+  )
+}
+
+export type SecurityRuleInput = {
+  key: { userId?: string; roleId?: string; groupId?: string }
+  value: string
+}
+
+const ACCESS_RANK: Record<string, number> = { None: 0, Read: 1, Edit: 2, Manage: 3 }
+
+export function withReaderRoles(rules: SecurityRuleInput[], roleIds: string[]): SecurityRuleInput[] {
+  const next = rules.map((rule) => ({ key: { ...rule.key }, value: rule.value }))
+  for (const roleId of roleIds) {
+    if (!roleId) continue
+    const existing = next.find((rule) => rule.key.roleId === roleId)
+    if (!existing) {
+      next.push({ key: { roleId }, value: "Read" })
+      continue
+    }
+    if ((ACCESS_RANK[existing.value] ?? 0) < ACCESS_RANK.Read) existing.value = "Read"
+  }
+  return next
+}
+
+const FORM_SECURITY = `
+  query FormSecurity($dataCollection: DataCollection!) {
+    dataForm(dataCollection: $dataCollection) {
+      securityTemplate { ${SECURITY_TEMPLATE_FIELDS} }
+    }
+  }
+`
+
+export async function securityRulesForNewEntry(
+  session: ConsolidateSession,
+  dataCollection: string,
+  adminUserId: string
+): Promise<{ key: { userId?: string; roleId?: string; groupId?: string }; value: string }[]> {
+  const result = await sessionGraphql<{
+    dataForm: { securityTemplate: SecurityRule[] | null } | null
+  }>(session, FORM_SECURITY, { dataCollection })
+  const message = collectMessages(result.errors)
+  if (message || !result.data?.dataForm) {
+    throw new Error(message || "Die Formularrechte konnten nicht gelesen werden.")
+  }
+  return withAdminManage(result.data.dataForm.securityTemplate, adminUserId)
+}
+
+const UPDATE_ENTRY_SECURITY = `
+  mutation UpdateEntrySecurity($input: UpdateDataEntrySecurityInput!) {
+    updateDataEntrySecurity(input: $input) {
+      dataEntry { id }
+      errors { ... on Error { message } }
+    }
+  }
+`
+
+export async function grantDataEntrySecurity(
+  session: ConsolidateSession,
+  id: string,
+  securityRules: SecurityRuleInput[]
+): Promise<void> {
+  const result = await sessionGraphql<{
+    updateDataEntrySecurity: {
+      dataEntry: { id: string } | null
+      errors: PayloadError[] | null
+    } | null
+  }>(session, UPDATE_ENTRY_SECURITY, { input: { id, securityRules } })
+  const payload = result.data?.updateDataEntrySecurity
+  const message = collectMessages(result.errors, payload?.errors)
+  if (!payload?.dataEntry) throw new Error(message || "Die Leserechte wurden nicht gesetzt.")
+}
+
+const CALENDAR_READ_RANK: Record<string, number> = {
+  NotShared: 0,
+  CanViewWhenBusy: 1,
+  CanViewTitlesAndLocations: 2,
+  CanViewAllDetails: 3,
+  CanEdit: 4,
+}
+
+const CALENDAR_SHARES = `
+  query CalendarShares($id: ID!) {
+    calendar(id: $id) {
+      permissions {
+        global
+        userPermissions {
+          calendarPermission
+          user { id }
+        }
+      }
+    }
+  }
+`
+
+const SHARE_CALENDAR = `
+  mutation ShareCalendar($input: SetCalendarUserPermissionInput!) {
+    setCalendarUserPermission(input: $input) {
+      calendar { id }
+    }
+  }
+`
+
+export async function shareCalendarWithUsers(
+  session: ConsolidateSession,
+  calendarId: string,
+  userIds: string[]
+): Promise<{ shared: number; failed: number; message?: string }> {
+  const loaded = await sessionGraphql<{
+    calendar: {
+      permissions: {
+        global: string
+        userPermissions: { calendarPermission: string; user: { id: string } }[]
+      }
+    } | null
+  }>(session, CALENDAR_SHARES, { id: calendarId })
+  const permissions = loaded.data?.calendar?.permissions
+  const current = new Map(
+    (permissions?.userPermissions ?? []).map((entry) => [entry.user.id, entry.calendarPermission])
+  )
+  if ((CALENDAR_READ_RANK[permissions?.global ?? ""] ?? 0) >= CALENDAR_READ_RANK.CanViewAllDetails) {
+    return { shared: userIds.length, failed: 0 }
+  }
+
+  let shared = 0
+  let failed = 0
+  let message = ""
+  for (const userId of userIds) {
+    const existing = current.get(userId)
+    if (existing && (CALENDAR_READ_RANK[existing] ?? 0) >= CALENDAR_READ_RANK.CanViewAllDetails) {
+      shared += 1
+      continue
+    }
+    const result = await sessionGraphql<{
+      setCalendarUserPermission: { calendar: { id: string } | null } | null
+    }>(session, SHARE_CALENDAR, {
+      input: { id: calendarId, user: userId, permission: "CanViewAllDetails" },
+    })
+    if (result.data?.setCalendarUserPermission?.calendar) {
+      shared += 1
+      continue
+    }
+    failed += 1
+    message = collectMessages(result.errors) || message
+  }
+  return { shared, failed, message: message || undefined }
+}
+
+async function writeSecurityTemplate(
+  session: ConsolidateSession,
+  userId: string,
+  template: SecurityRuleInput[]
+): Promise<{ saved: SecurityRule[] | null; message: string }> {
+  const result = await sessionGraphql<{
+    editSecurityTemplate: {
+      iSecurityTemplateProvider: { securityTemplate: SecurityRule[] | null } | null
+    } | null
+  }>(session, EDIT_SECURITY_TEMPLATE, { input: { id: userId, template } })
+  return {
+    saved: result.data?.editSecurityTemplate?.iSecurityTemplateProvider?.securityTemplate ?? null,
+    message: collectMessages(result.errors),
+  }
+}
+
+async function grantAdminManage(
+  session: ConsolidateSession,
+  userId: string,
+  adminUserId: string,
+  current: SecurityRule[] | null,
+  readerRoleIds: string[]
+): Promise<void> {
+  const manageOnly = withAdminManage(current, adminUserId)
+  let written = await writeSecurityTemplate(
+    session,
+    userId,
+    withReaderRoles(manageOnly, readerRoleIds)
+  )
+  if (!adminHasManage(written.saved, adminUserId) && readerRoleIds.length > 0) {
+    written = await writeSecurityTemplate(session, userId, manageOnly)
+  }
+  if (!adminHasManage(written.saved, adminUserId)) {
+    throw new Error(written.message || "Das Manage-Recht für den verbundenen Service-User wurde nicht gesetzt.")
+  }
+}
 
 export async function createEmployee(
   session: ConsolidateSession,
@@ -699,11 +1120,18 @@ export async function createEmployee(
     password: string
     contactId?: string
     roleIds: string[]
+    adminUserId: string
+    readerRoleIds?: string[]
   }
 ): Promise<{ id: string; email: string; displayName: string }> {
   const result = await sessionGraphql<{
     createUser: {
-      user: { id: string; email: string; displayName: string } | null
+      user: {
+        id: string
+        email: string
+        displayName: string
+        securityTemplate: SecurityRule[] | null
+      } | null
       errors: PayloadError[] | null
     }
   }>(session, CREATE_USER, {
@@ -720,6 +1148,13 @@ export async function createEmployee(
   const user = result.data?.createUser?.user
   const message = collectMessages(result.errors, result.data?.createUser?.errors)
   if (!user) throw new Error(message || "Mitarbeiter wurde nicht angelegt.")
+  await grantAdminManage(
+    session,
+    user.id,
+    input.adminUserId,
+    user.securityTemplate,
+    input.readerRoleIds ?? []
+  )
   return user
 }
 
@@ -731,6 +1166,10 @@ const CREATE_PROJECT = `
   }
 `
 
+function missingInputField(message: string): string | null {
+  return message.match(/The field `([^`]+)` does not exist on the type/i)?.[1] ?? null
+}
+
 export async function createProject(
   session: ConsolidateSession,
   input: {
@@ -741,9 +1180,10 @@ export async function createProject(
     projectManagerId?: string
     responsibleId?: string
     typeName?: string
+    securityRules?: SecurityRuleInput[]
   }
 ): Promise<{ id: string; displayName: string; linkedType: boolean }> {
-  const dataEntry = {
+  let dataEntry: Record<string, unknown> = {
     name: input.name,
     startDate: input.startDate,
     endDate: input.endDate,
@@ -751,28 +1191,43 @@ export async function createProject(
     ...(input.projectManagerId ? { projectManager: input.projectManagerId } : {}),
     ...(input.responsibleId ? { responsible: input.responsibleId } : {}),
   }
+  let typeName = input.typeName
+  let securityRules = input.securityRules
+  let lastMessage = "Projekt wurde nicht angelegt."
 
-  const first = await sessionGraphql<{
-    createProject: { project: { id: string; displayName: string } | null }
-  }>(session, CREATE_PROJECT, {
-    input: {
-      dataEntry,
-      ...(input.typeName ? { type: input.typeName } : {}),
-    },
-  })
-  const created = first.data?.createProject?.project
-  if (created) return { ...created, linkedType: Boolean(input.typeName) }
-
-  const message = collectMessages(first.errors)
-  if (input.typeName && /type|enum|ProjectTypes/i.test(message)) {
-    const retry = await sessionGraphql<{
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const result = await sessionGraphql<{
       createProject: { project: { id: string; displayName: string } | null }
-    }>(session, CREATE_PROJECT, { input: { dataEntry } })
-    const project = retry.data?.createProject?.project
-    if (project) return { ...project, linkedType: false }
-    throw new Error(collectMessages(retry.errors) || message)
+    }>(session, CREATE_PROJECT, {
+      input: {
+        dataEntry,
+        ...(typeName ? { type: typeName } : {}),
+        ...(securityRules ? { securityRules } : {}),
+      },
+    })
+    const created = result.data?.createProject?.project
+    if (created) return { ...created, linkedType: Boolean(typeName) }
+
+    lastMessage = collectMessages(result.errors) || lastMessage
+    if (securityRules && /securityRules/i.test(lastMessage)) {
+      securityRules = undefined
+      continue
+    }
+    const missing = missingInputField(lastMessage)
+    if (missing && Object.prototype.hasOwnProperty.call(dataEntry, missing)) {
+      const next = { ...dataEntry }
+      delete next[missing]
+      dataEntry = next
+      continue
+    }
+    if (typeName && /type|enum|ProjectTypes/i.test(lastMessage)) {
+      typeName = undefined
+      continue
+    }
+    break
   }
-  throw new Error(message || "Projekt wurde nicht angelegt.")
+
+  throw new Error(lastMessage)
 }
 
 const CREATE_TASK = `
@@ -794,11 +1249,13 @@ export async function createTaskRecord(
     responsibleId?: string
     startDate: string
     dueDate: string
+    fallbackStatusId?: string
     typeName?: string
     extraFields?: Record<string, string | number | boolean>
+    securityRules?: SecurityRuleInput[]
   }
 ): Promise<{ id: string; displayName: string; changeVector?: string | null; linkedType: boolean; fieldsApplied: boolean }> {
-  const baseEntry = {
+  const baseEntry: Record<string, unknown> = {
     subject: input.subject,
     status: input.statusId,
     priority: input.priority,
@@ -810,7 +1267,23 @@ export async function createTaskRecord(
   }
   const extra = input.extraFields ?? {}
   const hasExtra = Object.keys(extra).length > 0
+  const withoutResponsible = { ...baseEntry }
+  delete withoutResponsible.responsible
 
+  const variants: { dataEntry: Record<string, unknown>; typeName?: string; fieldsApplied: boolean }[] = [
+    { dataEntry: { ...baseEntry, ...extra }, typeName: input.typeName, fieldsApplied: hasExtra },
+  ]
+  if (hasExtra) variants.push({ dataEntry: { ...baseEntry }, typeName: input.typeName, fieldsApplied: false })
+  if (input.typeName) variants.push({ dataEntry: { ...baseEntry }, fieldsApplied: false })
+  if (input.responsibleId) variants.push({ dataEntry: { ...withoutResponsible }, fieldsApplied: false })
+  if (input.fallbackStatusId && input.fallbackStatusId !== input.statusId) {
+    variants.push({
+      dataEntry: { ...withoutResponsible, status: input.fallbackStatusId },
+      fieldsApplied: false,
+    })
+  }
+
+  let securityRules = input.securityRules
   const post = (dataEntry: Record<string, unknown>, typeName?: string) =>
     sessionGraphql<{
       createTask: { task: { id: string; displayName: string; changeVector?: string | null } | null }
@@ -818,27 +1291,29 @@ export async function createTaskRecord(
       input: {
         dataEntry,
         ...(typeName ? { type: typeName } : {}),
+        ...(securityRules ? { securityRules } : {}),
       },
     })
 
-  const first = await post({ ...baseEntry, ...extra }, input.typeName)
-  const created = first.data?.createTask?.task
-  if (created) return { ...created, linkedType: Boolean(input.typeName), fieldsApplied: hasExtra }
-
-  if (hasExtra) {
-    const withoutFields = await post(baseEntry, input.typeName)
-    const task = withoutFields.data?.createTask?.task
-    if (task) return { ...task, linkedType: Boolean(input.typeName), fieldsApplied: false }
+  let lastMessage = "Aufgabe wurde nicht angelegt."
+  for (const variant of variants) {
+    const result = await post(variant.dataEntry, variant.typeName)
+    const task = result.data?.createTask?.task
+    if (task) {
+      return {
+        ...task,
+        linkedType: Boolean(variant.typeName),
+        fieldsApplied: variant.fieldsApplied,
+      }
+    }
+    lastMessage = collectMessages(result.errors) || lastMessage
+    if (securityRules && /securityRules/i.test(lastMessage)) {
+      securityRules = undefined
+      continue
+    }
+    if (!/ValueNotAllowed|UnknownField|service user|type|enum|TaskTypes|not allowed/i.test(lastMessage)) break
   }
-
-  const message = collectMessages(first.errors)
-  if (input.typeName && /type|enum|TaskTypes/i.test(message)) {
-    const retry = await post(baseEntry)
-    const task = retry.data?.createTask?.task
-    if (task) return { ...task, linkedType: false, fieldsApplied: false }
-    throw new Error(collectMessages(retry.errors) || message)
-  }
-  throw new Error(message || "Aufgabe wurde nicht angelegt.")
+  throw new Error(lastMessage)
 }
 
 const TASK_FILE_STATE = `
@@ -888,6 +1363,51 @@ type TaskFileState = {
   attachments: { id: string; name: string; isVersioned: boolean; versionCount: number }[]
 }
 
+const CURRENT_CHANGE_VECTOR = `
+  query CurrentChangeVector($id: ID!) {
+    dataEntry(id: $id) { changeVector }
+  }
+`
+
+async function readChangeVector(session: ConsolidateSession, id: string): Promise<string | undefined> {
+  const result = await sessionGraphql<{ dataEntry: { changeVector?: string | null } | null }>(
+    session,
+    CURRENT_CHANGE_VECTOR,
+    { id }
+  )
+  return result.data?.dataEntry?.changeVector ?? undefined
+}
+
+function vectorFromConflict(message: string): string | undefined {
+  return message.match(/but found\s+['"]([^'"]+)['"]/i)?.[1]
+}
+
+function isChangeConflict(message: string): boolean {
+  return /change vector|document was changed/i.test(message)
+}
+
+async function runWithChangeVector<T extends { changeVector?: string | null }>(
+  session: ConsolidateSession,
+  id: string,
+  startingVector: string | undefined,
+  run: (changeVector: string | undefined) => Promise<{ ok: boolean; message: string; value?: T }>
+): Promise<{ value: T; vector: string | undefined }> {
+  let vector = startingVector || (await readChangeVector(session, id))
+  let outcome = await run(vector)
+  for (let attempt = 0; attempt < 4 && !outcome.ok && isChangeConflict(outcome.message); attempt += 1) {
+    const found = vectorFromConflict(outcome.message)
+    const fresh = found === vector ? await readChangeVector(session, id) : undefined
+    const next = found && found !== vector ? found : fresh && fresh !== vector ? fresh : undefined
+    if (!next) break
+    vector = next
+    outcome = await run(vector)
+  }
+  if (!outcome.ok || !outcome.value) {
+    throw new Error(outcome.message || "Der Änderungsstand konnte nicht übernommen werden.")
+  }
+  return { value: outcome.value, vector: outcome.value.changeVector ?? vector }
+}
+
 export async function attachTaskFile(
   session: ConsolidateSession,
   input: {
@@ -899,35 +1419,51 @@ export async function attachTaskFile(
   }
 ): Promise<{ versionCount: number }> {
   if (input.versions.length === 0) throw new Error("Die Datei hat keinen Inhalt.")
-  const uploaded = await sessionGraphqlUpload<{
-    updateTask: { task: TaskFileState | null }
-  }>(
-    session,
-    UPDATE_TASK_FILE,
-    {
-      input: {
-        id: input.taskId,
-        ...(input.changeVector ? { changeVector: input.changeVector } : {}),
-        newAttachments: [{ file: null }],
-      },
-    },
-    [
+  const uploadBody = input.versions[0]
+  const uploadOnce = (changeVector: string | undefined) =>
+    sessionGraphqlUpload<{
+      updateTask: { task: TaskFileState | null }
+    }>(
+      session,
+      UPDATE_TASK_FILE,
       {
-        path: "variables.input.newAttachments.0.file",
-        filename: input.fileName,
-        contentType: input.contentType,
-        body: input.versions[0],
+        input: {
+          id: input.taskId,
+          ...(changeVector ? { changeVector } : {}),
+          newAttachments: [{ file: null }],
+        },
       },
-    ]
+      [
+        {
+          path: "variables.input.newAttachments.0.file",
+          filename: input.fileName,
+          contentType: input.contentType,
+          body: uploadBody,
+        },
+      ]
+    )
+
+  const uploaded = await runWithChangeVector(
+    session,
+    input.taskId,
+    input.changeVector ?? undefined,
+    async (changeVector) => {
+      const result = await uploadOnce(changeVector)
+      const message = collectMessages(result.errors)
+      const task = isChangeConflict(message) ? undefined : result.data?.updateTask?.task ?? undefined
+      return {
+        ok: Boolean(task),
+        message: message || (task ? "" : "Die Datei wurde nicht angehängt."),
+        value: task,
+      }
+    }
   )
-  const task = uploaded.data?.updateTask?.task
-  const attachment = task?.attachments?.find((item) => item.name === input.fileName) ?? task?.attachments?.at(-1)
-  if (!task || !attachment) {
-    throw new Error(collectMessages(uploaded.errors) || "Die Datei wurde nicht angehängt.")
-  }
+  const task = uploaded.value
+  let changeVector = uploaded.vector
+  const attachment = task.attachments?.find((item) => item.name === input.fileName) ?? task.attachments?.at(-1)
+  if (!attachment) throw new Error("Die Datei wurde nicht angehängt.")
   if (input.versions.length === 1) return { versionCount: attachment.versionCount || 1 }
 
-  let changeVector = task.changeVector ?? undefined
   const history = await sessionGraphql<{
     createVersionHistory: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
   }>(session, CREATE_VERSION_HISTORY, {
@@ -940,51 +1476,59 @@ export async function attachTaskFile(
   changeVector = history.data?.createVersionHistory?.dataEntry?.changeVector ?? changeVector
 
   for (let index = 1; index < input.versions.length; index += 1) {
-    const draft = await sessionGraphqlUpload<{
-      createDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
-    }>(
-      session,
-      CREATE_DRAFT,
-      {
+    const drafted = await runWithChangeVector(session, input.taskId, changeVector, async (vector) => {
+      const draft = await sessionGraphqlUpload<{
+        createDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
+      }>(
+        session,
+        CREATE_DRAFT,
+        {
+          input: {
+            dataEntryId: input.taskId,
+            attachmentId: attachment.id,
+            newFile: null,
+            ...(vector ? { changeVector: vector } : {}),
+          },
+        },
+        [
+          {
+            path: "variables.input.newFile",
+            filename: input.fileName,
+            contentType: input.contentType,
+            body: input.versions[index],
+          },
+        ]
+      )
+      const message = collectMessages(draft.errors, draft.data?.createDraft?.errors)
+      const entry = isChangeConflict(message) ? undefined : draft.data?.createDraft?.dataEntry ?? undefined
+      return {
+        ok: Boolean(entry),
+        message: message || (entry ? "" : `Version ${index + 1} wurde nicht angelegt.`),
+        value: entry,
+      }
+    })
+    changeVector = drafted.vector
+    const approved = await runWithChangeVector(session, input.taskId, changeVector, async (vector) => {
+      const result = await sessionGraphql<{
+        approveDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
+      }>(session, APPROVE_DRAFT, {
         input: {
           dataEntryId: input.taskId,
           attachmentId: attachment.id,
-          newFile: null,
-          ...(changeVector ? { changeVector } : {}),
+          comment: `Version ${index + 1}`,
+          ...(vector ? { changeVector: vector } : {}),
         },
-      },
-      [
-        {
-          path: "variables.input.newFile",
-          filename: input.fileName,
-          contentType: input.contentType,
-          body: input.versions[index],
-        },
-      ]
-    )
-    const draftMessage = collectMessages(draft.errors, draft.data?.createDraft?.errors)
-    if (!draft.data?.createDraft?.dataEntry) {
-      throw new Error(draftMessage || `Version ${index + 1} wurde nicht angelegt.`)
-    }
-    changeVector = draft.data.createDraft.dataEntry.changeVector ?? changeVector
-    const approved = await sessionGraphql<{
-      approveDraft: { dataEntry: TaskFileState | null; errors: PayloadError[] | null }
-    }>(session, APPROVE_DRAFT, {
-      input: {
-        dataEntryId: input.taskId,
-        attachmentId: attachment.id,
-        comment: `Version ${index + 1}`,
-        ...(changeVector ? { changeVector } : {}),
-      },
+      })
+      const message = collectMessages(result.errors, result.data?.approveDraft?.errors)
+      const entry = isChangeConflict(message) ? undefined : result.data?.approveDraft?.dataEntry ?? undefined
+      return {
+        ok: Boolean(entry),
+        message: message || (entry ? "" : `Version ${index + 1} wurde nicht freigegeben.`),
+        value: entry,
+      }
     })
-    const approvedMessage = collectMessages(approved.errors, approved.data?.approveDraft?.errors)
-    if (!approved.data?.approveDraft?.dataEntry) {
-      throw new Error(approvedMessage || `Version ${index + 1} wurde nicht freigegeben.`)
-    }
-    changeVector = approved.data.approveDraft.dataEntry.changeVector ?? changeVector
-    const count = approved.data.approveDraft.dataEntry.attachments?.find(
-      (item) => item.id === attachment.id
-    )?.versionCount
+    changeVector = approved.vector
+    const count = approved.value.attachments?.find((item) => item.id === attachment.id)?.versionCount
     if (index === input.versions.length - 1) return { versionCount: count || input.versions.length }
   }
 
@@ -1124,6 +1668,10 @@ export async function createCalendarEvent(
 const ADD_ASSOCIATION = `
   mutation AddAssociation($input: AddAssociationInput!) {
     addAssociation(input: $input) {
+      entity {
+        ... on Task { changeVector }
+        ... on DataEntry { changeVector }
+      }
       errors { ... on Error { message } }
     }
   }
@@ -1132,18 +1680,33 @@ const ADD_ASSOCIATION = `
 export async function associateRecords(
   session: ConsolidateSession,
   entityId: string,
-  associationId: string
-): Promise<void> {
-  const result = await sessionGraphql<{
-    addAssociation: { errors: PayloadError[] | null } | null
-  }>(session, ADD_ASSOCIATION, {
-    input: { entity: entityId, association: associationId },
-  })
-  const message = collectMessages(result.errors, result.data?.addAssociation?.errors)
-  if (message) throw new Error(message)
-  if (!result.data?.addAssociation) {
-    throw new Error("Die Verknüpfung wurde nicht gespeichert.")
+  associationId: string,
+  changeVector?: string | null
+): Promise<string | undefined> {
+  let vector = changeVector ?? undefined
+  let message = "Die Verknüpfung wurde nicht gespeichert."
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const result = await sessionGraphql<{
+      addAssociation: {
+        entity: { changeVector?: string | null } | null
+        errors: PayloadError[] | null
+      } | null
+    }>(session, ADD_ASSOCIATION, {
+      input: {
+        entity: entityId,
+        association: associationId,
+        ...(vector ? { changeVector: vector } : {}),
+      },
+    })
+    message = collectMessages(result.errors, result.data?.addAssociation?.errors)
+    if (!message && result.data?.addAssociation) {
+      return result.data.addAssociation.entity?.changeVector ?? vector
+    }
+    const found = vectorFromConflict(message)
+    if (!found || found === vector || !isChangeConflict(message)) break
+    vector = found
   }
+  throw new Error(message)
 }
 
 function escapeHtml(value: string): string {

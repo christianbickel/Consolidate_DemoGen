@@ -10,8 +10,7 @@ import {
 
 const loginSchema = z.object({
   instanceUrl: z.string().min(1),
-  username: z.string().min(1),
-  password: z.string().min(1),
+  apiKey: z.string().min(1),
 })
 
 export async function POST(request: Request) {
@@ -19,21 +18,18 @@ export async function POST(request: Request) {
   const parsed = loginSchema.safeParse(json)
   if (!parsed.success) {
     return Response.json(
-      { error: "Instanz-URL, Benutzername und Passwort werden benötigt." },
+      { error: "Instanz-URL und API-Schlüssel werden benötigt." },
       { status: 400 }
     )
   }
 
   try {
     const instanceUrl = normalizeGraphqlUrl(parsed.data.instanceUrl)
-    const auth = await authenticate(
-      instanceUrl,
-      parsed.data.username.trim(),
-      parsed.data.password
-    )
+    const apiKey = parsed.data.apiKey.trim()
+    const auth = await authenticate(instanceUrl, apiKey)
     const session = buildSession({
       instanceUrl,
-      username: parsed.data.username.trim(),
+      apiKey,
       cookieHeader: auth.cookieHeader,
       me: auth.me,
     })

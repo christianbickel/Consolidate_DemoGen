@@ -11,8 +11,15 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import type { DemoPlan } from "@/lib/demo-plan"
+import { genderLabel, inferPersonGender } from "@/lib/person-gender"
 
-export function PlanPreview({ plan }: { plan: DemoPlan }) {
+export function PlanPreview({
+  plan,
+  adminName,
+}: {
+  plan: DemoPlan
+  adminName: string
+}) {
   return (
     <Tabs defaultValue="types">
       <TabsList>
@@ -57,6 +64,7 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Kontakt</TableHead>
+                <TableHead>Geschlecht</TableHead>
                 <TableHead>Rolle</TableHead>
                 <TableHead>Unternehmen</TableHead>
                 <TableHead>E-Mail</TableHead>
@@ -68,6 +76,7 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
                   <TableCell>
                     {contact.firstName} {contact.lastName}
                   </TableCell>
+                  <TableCell>{genderLabel(contact.gender ?? inferPersonGender(contact.firstName))}</TableCell>
                   <TableCell>{contact.position}</TableCell>
                   <TableCell>{plan.companies[contact.companyIndex]?.name}</TableCell>
                   <TableCell>{contact.email}</TableCell>
@@ -90,6 +99,7 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead>Geschlecht</TableHead>
                 <TableHead>Rolle</TableHead>
                 <TableHead>Team</TableHead>
                 <TableHead>E-Mail</TableHead>
@@ -101,6 +111,7 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
                   <TableCell>
                     {employee.firstName} {employee.lastName}
                   </TableCell>
+                  <TableCell>{genderLabel(employee.gender ?? inferPersonGender(employee.firstName))}</TableCell>
                   <TableCell>{employee.position}</TableCell>
                   <TableCell>{plan.teams[employee.teamIndex]?.name}</TableCell>
                   <TableCell>{employee.email}</TableCell>
@@ -151,6 +162,8 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
               <TableHead>Typ</TableHead>
               <TableHead>Projekt</TableHead>
               <TableHead>Status</TableHead>
+              <TableHead>Zeitraum</TableHead>
+              <TableHead>Verantwortlich</TableHead>
               <TableHead>Datei</TableHead>
               <TableHead>Felder</TableHead>
             </TableRow>
@@ -168,6 +181,14 @@ export function PlanPreview({ plan }: { plan: DemoPlan }) {
                   </span>
                 </TableCell>
                 <TableCell>{task.statusName || task.statusCategory}</TableCell>
+                <TableCell>
+                  {task.startDate} – {task.dueDate}
+                </TableCell>
+                <TableCell>
+                  {task.assignToAdmin
+                    ? adminName
+                    : `${plan.employees[task.assigneeIndex]?.firstName ?? ""} ${plan.employees[task.assigneeIndex]?.lastName ?? ""}`.trim()}
+                </TableCell>
                 <TableCell>
                   {task.file
                     ? task.file.versions > 1

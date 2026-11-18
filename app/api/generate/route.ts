@@ -11,7 +11,6 @@ const requestSchema = z.object({
   language: languageSchema,
   profile: z.string().trim().min(20),
   presetId: presetIdSchema,
-  apiKey: z.string().optional(),
 })
 
 export async function POST(request: Request) {
@@ -23,12 +22,9 @@ export async function POST(request: Request) {
       { status: 400 }
     )
   }
-  if (!parsed.data.apiKey?.trim() && !process.env.OPENAI_API_KEY?.trim()) {
+  if (!process.env.OPENAI_API_KEY?.trim()) {
     return Response.json(
-      {
-        error:
-          "Kein OpenAI-API-Key. Trage ihn im Formular ein oder setze OPENAI_API_KEY.",
-      },
+      { error: "Kein OpenAI-API-Key. Setze OPENAI_API_KEY in der Umgebung." },
       { status: 400 }
     )
   }

@@ -128,7 +128,7 @@ function buildPdf(lines: string[]): Buffer {
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
     "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
     `<< /Length ${Buffer.byteLength(stream, "ascii")} >>\nstream\n${stream}\nendstream`,
-    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
   ]
   let body = "%PDF-1.4\n"
   const offsets = [0]
@@ -146,20 +146,64 @@ function buildPdf(lines: string[]): Buffer {
 }
 
 function pdfEscape(value: string): string {
-  const winAnsi: Record<string, string> = {
-    ä: "\\344",
-    ö: "\\366",
-    ü: "\\374",
-    Ä: "\\304",
-    Ö: "\\326",
-    Ü: "\\334",
-    ß: "\\337",
+  let encoded = ""
+  for (const char of value) {
+    if (char === "\\") {
+      encoded += "\\\\"
+      continue
+    }
+    if (char === "(") {
+      encoded += "\\("
+      continue
+    }
+    if (char === ")") {
+      encoded += "\\)"
+      continue
+    }
+    const code = char.charCodeAt(0)
+    if (code >= 32 && code <= 126) {
+      encoded += char
+      continue
+    }
+    const byte = winAnsiByte(char)
+    if (byte === undefined) continue
+    encoded += `\\${byte.toString(8).padStart(3, "0")}`
   }
-  return value
-    .replace(/\\/g, "\\\\")
-    .replace(/\(/g, "\\(")
-    .replace(/\)/g, "\\)")
-    .replace(/[^\n]/g, (char) => winAnsi[char] ?? (char.charCodeAt(0) > 126 ? "" : char))
+  return encoded
+}
+
+function winAnsiByte(char: string): number | undefined {
+  const extras: Record<string, number> = {
+    "€": 0x80,
+    "‚": 0x82,
+    "„": 0x84,
+    "…": 0x85,
+    "†": 0x86,
+    "‡": 0x87,
+    "‰": 0x89,
+    Š: 0x8a,
+    "‹": 0x8b,
+    Œ: 0x8c,
+    Ž: 0x8e,
+    "‘": 0x91,
+    "’": 0x92,
+    "“": 0x93,
+    "”": 0x94,
+    "•": 0x95,
+    "–": 0x96,
+    "—": 0x97,
+    "™": 0x99,
+    š: 0x9a,
+    "›": 0x9b,
+    œ: 0x9c,
+    ž: 0x9e,
+    Ÿ: 0x9f,
+  }
+  const extra = extras[char]
+  if (extra !== undefined) return extra
+  const code = char.charCodeAt(0)
+  if (code >= 0xa0 && code <= 0xff) return code
+  return undefined
 }
 
 function buildDocx(lines: string[]): Buffer {

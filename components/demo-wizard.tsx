@@ -8,6 +8,7 @@ import { PlanPreview } from "@/components/plan-preview"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Card,
   CardContent,
@@ -44,7 +45,7 @@ import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { DEMO_PRESETS, type DemoPresetId } from "@/lib/demo-presets"
-import type { DemoLanguage, DemoPlan } from "@/lib/demo-plan"
+import { normalizeGraphqlUrl, type DemoLanguage, type DemoPlan } from "@/lib/demo-plan"
 import {
   getProfileTemplates,
   getServerProfileTemplates,
@@ -53,6 +54,7 @@ import {
   subscribeProfileTemplates,
 } from "@/lib/profile-templates"
 import { readNdjson, type ImportSummary, type StreamEvent } from "@/lib/stream-events"
+import { DEMO_WIPE_ERROR, instanceAllowsWipe } from "@/lib/wipe-guard"
 
 type Step = "login" | "profile" | "generate"
 
@@ -79,8 +81,7 @@ export function DemoWizard() {
   const [step, setStep] = useState<Step>("login")
   const [session, setSession] = useState<ConnectedSession | null>(null)
   const [instanceUrl, setInstanceUrl] = useState("https://staging.consi.cloud/graphql")
-  const [username, setUsername] = useState("")
-  const [password, setPassword] = useState("")
+  const [serviceApiKey, setServiceApiKey] = useState("")
   const [language, setLanguage] = useState<DemoLanguage>("de")
   const [profile, setProfile] = useState("")
   const templates = useSyncExternalStore(
@@ -90,12 +91,12 @@ export function DemoWizard() {
   )
   const submittedProfile = useRef("")
   const [presetId, setPresetId] = useState<DemoPresetId>("small")
-  const [apiKey, setApiKey] = useState("")
   const [busy, setBusy] = useState<"login" | "generate" | "import" | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [progress, setProgress] = useState({ completed: 0, total: 0, label: "" })
   const [plan, setPlan] = useState<DemoPlan | null>(null)
+  const [wipeFirst, setWipeFirst] = useState(false)
   const [summary, setSummary] = useState<ImportSummary | null>(null)
   const logId = useRef(0)
 
@@ -151,17 +152,19 @@ export function DemoWizard() {
     setBusy("login")
     setError(null)
     try {
+      const graphqlUrl = normalizeGraphqlUrl(instanceUrl)
+      setInstanceUrl(graphqlUrl)
       const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ instanceUrl, username, password }),
+        body: JSON.stringify({ instanceUrl: graphqlUrl, apiKey: serviceApiKey }),
       })
       const payload = (await response.json()) as ConnectedSession & { error?: string }
       if (!response.ok || !payload.connected) {
         throw new Error(payload.error || "Anmeldung fehlgeschlagen.")
       }
       setSession(payload)
-      setPassword("")
+      setServiceApiKey("")
       setStep("profile")
     } catch (loginError) {
       setError(loginError instanceof Error ? loginError.message : "Anmeldung fehlgeschlagen.")
@@ -192,7 +195,6 @@ export function DemoWizard() {
           language,
           profile,
           presetId,
-          apiKey: apiKey.trim() || undefined,
         }),
       })
       await readNdjson(response, onStreamEvent)
@@ -211,6 +213,18 @@ export function DemoWizard() {
     setBusy("import")
     resetRun()
     try {
+      if (wipeFirst) {
+        if (!instanceAllowsWipe(session?.instanceUrl ?? instanceUrl)) {
+          throw new Error(DEMO_WIPE_ERROR)
+        }
+        const wipeResponse = await fetch("/api/wipe", { method: "POST" })
+        let wipeFailed = false
+        await readNdjson(wipeResponse, (event) => {
+          if (event.type === "error") wipeFailed = true
+          onStreamEvent(event)
+        })
+        if (wipeFailed) return
+      }
       const response = await fetch("/api/import", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -278,53 +292,63 @@ export function DemoWizard() {
             <CardHeader>
               <CardTitle>Verbindung und Anmeldung</CardTitle>
               <CardDescription>
-                Die Anmeldung läuft über die Consolidate-Sitzung. Das Cookie bleibt auf diesem Server,
-                der Browser spricht nur mit dieser Anwendung.
+                Die Verbindung nutzt den API-Schlüssel eines Service-Users.
               </CardDescription>
             </CardHeader>
             <form onSubmit={login}>
               <CardContent>
-                <FieldGroup>
-                  <Field>
-                    <FieldLabel htmlFor="instance-url">Instanz-URL</FieldLabel>
-                    <Input
-                      id="instance-url"
-                      value={instanceUrl}
-                      onChange={(event) => setInstanceUrl(event.target.value)}
-                      autoComplete="url"
-                      required
-                    />
-                    <FieldDescription>
-                      GraphQL-Endpunkt. Eine Instanz-Adresse ohne /graphql wird ergänzt.
-                    </FieldDescription>
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="username">Admin-Benutzername oder E-Mail</FieldLabel>
-                    <Input
-                      id="username"
-                      value={username}
-                      onChange={(event) => setUsername(event.target.value)}
-                      autoComplete="username"
-                      required
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="password">Passwort</FieldLabel>
-                    <Input
-                      id="password"
-                      type="password"
-                      value={password}
-                      onChange={(event) => setPassword(event.target.value)}
-                      autoComplete="current-password"
-                      required
-                    />
-                  </Field>
-                </FieldGroup>
+                <div className="flex flex-col gap-6">
+                  <Alert>
+                    <AlertTitle>Hinweis</AlertTitle>
+                    <AlertDescription>
+                      <p>
+                        Der API-Key wird nur serverseitig in der Sitzung gehalten und nicht gespeichert.
+                        Nach dem Verbinden leert das Formular das Feld. Die öffentliche Sitzung enthält
+                        den Schlüssel nicht.
+                      </p>
+                      <p>
+                        Der Service-User braucht mindestens die Rechte „Benutzer bearbeiten“ und
+                        „Datenformulare“. Außerdem sollte er auch die Berechtigungen für die
+                        Stammdaten-Bearbeitung haben. Fehlt eines davon, bricht die Verbindung mit einem
+                        entsprechenden Hinweis ab.
+                      </p>
+                    </AlertDescription>
+                  </Alert>
+                  <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="instance-url">Instanz-URL</FieldLabel>
+                      <Input
+                        id="instance-url"
+                        value={instanceUrl}
+                        onChange={(event) => setInstanceUrl(event.target.value)}
+                        autoComplete="url"
+                        required
+                      />
+                      <FieldDescription>
+                        GraphQL-Endpunkt. Fehlen https:// oder /graphql, werden sie ergänzt.
+                      </FieldDescription>
+                    </Field>
+                    <Field>
+                      <FieldLabel htmlFor="service-api-key">API-Schlüssel</FieldLabel>
+                      <Input
+                        id="service-api-key"
+                        type="password"
+                        value={serviceApiKey}
+                        onChange={(event) => setServiceApiKey(event.target.value)}
+                        autoComplete="off"
+                        required
+                      />
+                      <FieldDescription>
+                        Schlüssel eines Service-Users aus den Consolidate-Einstellungen unter API Keys.
+                      </FieldDescription>
+                    </Field>
+                  </FieldGroup>
+                </div>
               </CardContent>
               <CardFooter>
                 <Button type="submit" disabled={busy !== null}>
                   {busy === "login" ? <Spinner data-icon="inline-start" /> : <LogInIcon data-icon="inline-start" />}
-                  Verbinden und anmelden
+                  Verbinden
                 </Button>
               </CardFooter>
             </form>
@@ -403,7 +427,8 @@ export function DemoWizard() {
                   ) : (
                     <FieldDescription>
                       Branche, Größe und Arbeitsweise. Daraus entstehen die Typen und die Beispiele.
-                      Erzeugte Vorschauen bleiben hier als Vorlage erhalten.
+                      Die Unternehmen sind typische Kunden, nicht Mitbewerber. Erzeugte Vorschauen
+                      bleiben hier als Vorlage erhalten.
                     </FieldDescription>
                   )}
                 </Field>
@@ -436,21 +461,6 @@ export function DemoWizard() {
                     <Badge variant="outline">{preset.appointments} Termine</Badge>
                   </div>
                 </Field>
-                <Field>
-                  <FieldLabel htmlFor="api-key">OpenAI API-Key</FieldLabel>
-                  <Input
-                    id="api-key"
-                    type="password"
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    autoComplete="off"
-                    placeholder="sk-…"
-                  />
-                  <FieldDescription>
-                    Optional, wenn OPENAI_API_KEY bereits in der Umgebung steht. Der Key wird nicht
-                    gespeichert.
-                  </FieldDescription>
-                </Field>
               </FieldGroup>
             </CardContent>
             <CardFooter>
@@ -469,7 +479,7 @@ export function DemoWizard() {
                 <CardTitle>Generierung und Import</CardTitle>
                 <CardDescription>
                   Zuerst die Vorschau prüfen, danach schreibt der Import Typen mit Zusatzfeldern und
-                  Statuswerten, Unternehmen, Kontakte, Teams, Mitarbeiter, Projekte, Aufgaben und Termine.
+                  Statuswerten, Unternehmen mit Logo, Kontakte mit Avatarbild, Teams, Mitarbeiter, Projekte, Aufgaben und Termine.
                   Etwa jede fünfte Aufgabe enthält ein PDF oder Word-Dokument, ein Teil davon in zwei oder drei Versionen.
                 </CardDescription>
               </CardHeader>
@@ -499,6 +509,15 @@ export function DemoWizard() {
                   {busy === "import" ? <Spinner data-icon="inline-start" /> : null}
                   In Consolidate anlegen
                 </Button>
+                <Field orientation="horizontal" className="w-fit">
+                  <Checkbox
+                    id="wipe-instance"
+                    checked={wipeFirst}
+                    onCheckedChange={(checked) => setWipeFirst(checked)}
+                    disabled={busy !== null}
+                  />
+                  <FieldLabel htmlFor="wipe-instance">Instanz vorher leeren</FieldLabel>
+                </Field>
               </CardFooter>
             </Card>
 
@@ -514,7 +533,10 @@ export function DemoWizard() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <PlanPreview plan={plan} />
+                  <PlanPreview
+                    plan={plan}
+                    adminName={session?.displayName || session?.username || "Verbundener Service-User"}
+                  />
                 </CardContent>
               </Card>
             ) : (

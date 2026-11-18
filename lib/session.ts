@@ -14,6 +14,7 @@ export type PublicSession = {
 
 export type ConsolidateSession = PublicSession & {
   id: string
+  apiKey: string
   cookieHeader: string
 }
 
@@ -40,7 +41,9 @@ export async function readSession(): Promise<ConsolidateSession | null> {
   const cookieStore = await cookies()
   const id = cookieStore.get(SESSION_COOKIE)?.value
   if (!id) return null
-  return store().get(id) ?? null
+  const session = store().get(id)
+  if (!session?.apiKey) return null
+  return session
 }
 
 export function toPublicSession(session: ConsolidateSession): PublicSession {
