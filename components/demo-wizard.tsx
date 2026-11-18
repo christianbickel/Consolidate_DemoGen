@@ -546,6 +546,7 @@ export function DemoWizard() {
                   </div>
                   <Separator />
                   <Button
+                    nativeButton={false}
                     render={
                       <a href={summary.appUrl} target="_blank" rel="noreferrer" />
                     }
