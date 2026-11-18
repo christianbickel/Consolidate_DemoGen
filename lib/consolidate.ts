@@ -457,7 +457,7 @@ function toAdditionalField(field: TaskFieldDefinition) {
     value: {
       key: field.key,
       label: field.label,
-      required: true,
+      required: false,
       valueType: field.valueType,
       selectionType: "Single",
       searchable:
